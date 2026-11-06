@@ -237,6 +237,15 @@ fn resolve_host_creation(
                 .map(|(name, _)| name.as_str()),
         )
     };
+    let plugin_owned = |name: &str| {
+        crate::plugin::agent_integration::declared_agent(
+            plugin_registry.clone(),
+            name,
+            config.session.custom_agents.iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        ).is_some()
+    };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
@@ -274,6 +283,10 @@ fn resolve_host_creation(
             }
             body.tool = name.to_owned();
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
+            anyhow::ensure!(
+                !plugin_owned(tool) || body.command_override.is_empty(),
+                "--cmd-override cannot be used with plugin-provided agent --tool selections"
+            );
             body.tool = tool.to_owned();
         } else if let Some(tool) = plugin_tool(name) {
             anyhow::ensure!(
