@@ -498,8 +498,116 @@ pub fn replies_configured(instance: &Instance) -> bool {
     configured_for(instance, true)
 }
 
+/// Where the session's effective configuration leaves a tool name.
+///
+/// A blank command is not a selection: the plugin still supplies the launch.
+/// An unreadable configuration is neither state, and must fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomOwnership {
+    /// The configuration launches a custom command under this name.
+    Custom,
+    /// The configuration leaves the name to the plugin.
+    Plugin,
+    /// The configuration could not be read.
+    Unavailable,
+}
+
+fn custom_ownership(instance: &Instance, tool: &str) -> CustomOwnership {
+    match effective_config(instance) {
+        Ok(config) => {
+            if config
+                .session
+                .custom_agents
+                .get(tool)
+                .is_some_and(|command| !command.trim().is_empty())
+            {
+                CustomOwnership::Custom
+            } else {
+                CustomOwnership::Plugin
+            }
+        }
+        Err(()) => CustomOwnership::Unavailable,
+    }
+}
+
+/// Changes to these files invalidate the cached effective configuration.
+type ConfigStamp = Option<(u64, u64, i64, i64, u64)>;
+
+fn stamp(path: &std::path::Path) -> ConfigStamp {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|meta| {
+        (
+            meta.dev(),
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.size(),
+        )
+    })
+}
+
+/// Global, state, profile and repo config, resolved once per file-state change.
+/// The status poll runs this per session per tick, so an uncached read would
+/// reparse every TOML file each time.
+fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session::Config>, ()> {
+    type CacheKey = (
+        std::path::PathBuf,
+        String,
+        std::path::PathBuf,
+        Vec<ConfigStamp>,
+    );
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<CacheKey, std::sync::Arc<crate::session::Config>>,
+        >,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let profile = instance.effective_profile();
+    let project = std::path::PathBuf::from(&instance.project_path);
+    let global_path = crate::session::config::config_path().map_err(|_| ())?;
+    let profile_dir = crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
+    let stamps = vec![
+        stamp(&global_path),
+        stamp(&crate::session::config::state_path().unwrap_or_else(|_| std::path::PathBuf::new())),
+        stamp(&profile_dir.join("config.toml")),
+        stamp(&crate::session::config::repo_config::repo_config_source_path(&project)),
+    ];
+    let key = (global_path, profile.clone(), project, stamps);
+
+    let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(config) = cache.get(&key) {
+        return Ok(config.clone());
+    }
+    drop(cache);
+
+    let resolved = (|| {
+        let global = crate::session::Config::load().ok()?;
+        let overrides =
+            crate::session::config::profile_config::load_profile_config(&profile).ok()?;
+        let config = crate::session::config::profile_config::merge_configs(global, &overrides);
+        match crate::session::config::repo_config::load_repo_config(&key.2).ok()? {
+            Some(repo) => Some(crate::session::config::repo_config::merge_repo_config(
+                config, &repo,
+            )),
+            None => Some(config),
+        }
+    })()
+    .ok_or(())?;
+
+    let resolved = std::sync::Arc::new(resolved);
+    CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, resolved.clone());
+    Ok(resolved)
+}
+
+/// Whether an approved integration owns replies. Only a readable configuration
+/// that leaves the name to the plugin grants them: with an unreadable profile a
+/// same-name custom wrapper must keep its terminal approval keys.
 fn configured_for(instance: &Instance, replies: bool) -> bool {
     eligible(instance)
+        && custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin
         && super::registry().active().any(|plugin| {
             plugin
                 .manifest
@@ -557,18 +665,45 @@ pub(crate) fn owned_status(
         return None;
     }
     let registry = super::registry();
+    let own = custom_ownership(instance, &instance.tool);
+    // A same-name custom wrapper is a different program from the declaration.
+    if own == CustomOwnership::Custom {
+        return None;
+    }
     let alias = crate::tmux::status_rules::detection_tool(
         &instance.source_profile,
         &instance.tool,
         &instance.detect_as,
     );
     let (tool, plugin) = match provider(&registry, &instance.tool) {
-        Ok(None) => (alias.as_ref(), provider(&registry, &alias)),
-        result => (instance.tool.as_str(), result),
+        Ok(Some(plugin)) => (instance.tool.as_str(), Ok(Some(plugin))),
+        Ok(None) => match provider(&registry, &alias) {
+            Ok(Some(plugin)) => match custom_ownership(instance, &alias) {
+                CustomOwnership::Plugin => (alias.as_ref(), Ok(Some(plugin))),
+                // The provider establishes the claim; only the report needs the
+                // configuration, so keep it owned but unreadable.
+                CustomOwnership::Unavailable => {
+                    return Some((crate::session::Status::Unknown, false))
+                }
+                CustomOwnership::Custom => return None,
+            },
+            Ok(None) => (instance.tool.as_str(), Ok(None)),
+            Err(error) => (instance.tool.as_str(), Err(error)),
+        },
+        Err(error) => (instance.tool.as_str(), Err(error)),
     };
+    if own == CustomOwnership::Unavailable {
+        // An unreadable configuration may hide a same-name custom wrapper, so a
+        // real claim stays owned-but-unavailable instead of reaching the pane.
+        return match plugin {
+            Ok(Some(_)) | Err(_) => Some((crate::session::Status::Unknown, false)),
+            Ok(None) => None,
+        };
+    }
     let plugin = match plugin {
         Ok(Some(plugin)) => Some(plugin),
         Ok(None) => return None,
+        // Ambiguous claims are owned but unreadable.
         Err(_) => None,
     };
     let report = if pane_dead {
@@ -1490,6 +1625,77 @@ sandbox = "unsupported"
         );
         install_test_integration("acme.duplicate", "own-agent");
         super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn configured_custom_agent_name_owns_no_plugin_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-shadow");
+        install_test_integration("acme.shadow-provider", "shadow-agent");
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+
+        let mut instance = Instance::new("custom-shadow", "/tmp");
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "custom-shadow".into();
+        instance.status = crate::session::Status::Running;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.shadow-provider.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+
+        // The custom wrapper owns its own program, so the plugin claims neither
+        // its status nor its replies even with a matching report present.
+        assert!(!configured(&instance));
+        assert!(!replies_configured(&instance));
+        assert_eq!(owned_status(&instance, false), None);
+        assert!(declared_agent(registry, "shadow-agent", std::iter::empty()).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn unreadable_config_keeps_an_alias_claim_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        // The app-dir guard owns HOME/XDG for the whole test, so the malformed
+        // write and the assertion both target the isolated directory.
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.alias-unreadable", "alias-only");
+        super::super::reload_registry();
+        // A malformed global config makes every effective read fail.
+        std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
+
+        let mut instance = Instance::new("unreadable-alias", "/tmp");
+        instance.tool = "own-name".into();
+        instance.detect_as = "alias-only".into();
+        instance.status = crate::session::Status::Running;
+
+        // The provider claim is real, so the session stays owned and Unknown
+        // instead of falling through to pane detection.
         assert_eq!(
             owned_status(&instance, false),
             Some((crate::session::Status::Unknown, false))
