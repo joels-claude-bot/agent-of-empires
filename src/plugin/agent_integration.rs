@@ -1446,13 +1446,24 @@ sandbox = "unsupported"
             ("USERPROFILE", temp.path()),
         ]);
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("alias-ownership");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("own-agent".into(), "alias-agent".into());
+        crate::tmux::status_rules::install_from_config("alias-ownership", &config);
         install_test_integration("acme.alias", "alias-agent");
         super::super::reload_registry();
 
         let mut instance = Instance::new("alias-report", "/tmp");
         instance.tool = "own-agent".into();
-        instance.detect_as = "alias-agent".into();
+        instance.source_profile = "alias-ownership".into();
         instance.status = crate::session::Status::Running;
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
         let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
         let mut report = snapshot();
         report.instance_id = instance.id.clone();
