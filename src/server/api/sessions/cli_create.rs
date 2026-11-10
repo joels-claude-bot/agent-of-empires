@@ -241,10 +241,14 @@ fn resolve_host_creation(
         crate::plugin::agent_integration::declared_agent(
             plugin_registry.clone(),
             name,
-            config.session.custom_agents.iter()
+            config
+                .session
+                .custom_agents
+                .iter()
                 .filter(|(_, command)| !command.trim().is_empty())
                 .map(|(name, _)| name.as_str()),
-        ).is_some()
+        )
+        .is_some()
     };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
