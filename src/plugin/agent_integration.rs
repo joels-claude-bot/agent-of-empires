@@ -549,13 +549,12 @@ fn stamp(path: &std::path::Path) -> ConfigStamp {
 /// Global, state, profile and repo config, resolved once per file-state change.
 /// The status poll runs this per session per tick, so an uncached read would
 /// reparse every TOML file each time.
+///
+/// One entry per configuration identity: a stamp change replaces the previous
+/// snapshot rather than accumulating one full `Config` per historical edit.
 fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session::Config>, ()> {
-    type CacheKey = (
-        std::path::PathBuf,
-        String,
-        std::path::PathBuf,
-        Vec<ConfigStamp>,
-    );
+    type Identity = (std::path::PathBuf, String, std::path::PathBuf);
+    type CacheKey = (Identity, Vec<ConfigStamp>);
     static CACHE: std::sync::LazyLock<
         std::sync::Mutex<
             std::collections::HashMap<CacheKey, std::sync::Arc<crate::session::Config>>,
@@ -572,20 +571,22 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
         stamp(&profile_dir.join("config.toml")),
         stamp(&crate::session::config::repo_config::repo_config_source_path(&project)),
     ];
-    let key = (global_path, profile.clone(), project, stamps);
+    let identity = (global_path, profile.clone(), project);
+    let key = (identity.clone(), stamps);
 
-    let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(config) = cache.get(&key) {
-        return Ok(config.clone());
+    {
+        let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(config) = cache.get(&key) {
+            return Ok(config.clone());
+        }
     }
-    drop(cache);
 
     let resolved = (|| {
         let global = crate::session::Config::load().ok()?;
         let overrides =
             crate::session::config::profile_config::load_profile_config(&profile).ok()?;
         let config = crate::session::config::profile_config::merge_configs(global, &overrides);
-        match crate::session::config::repo_config::load_repo_config(&key.2).ok()? {
+        match crate::session::config::repo_config::load_repo_config(&identity.2).ok()? {
             Some(repo) => Some(crate::session::config::repo_config::merge_repo_config(
                 config, &repo,
             )),
@@ -595,10 +596,14 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     .ok_or(())?;
 
     let resolved = std::sync::Arc::new(resolved);
-    CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(key, resolved.clone());
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    // A concurrent resolver may have inserted a newer snapshot for this identity;
+    // never let a slower older read replace it.
+    if let Some(existing) = cache.get(&key) {
+        return Ok(existing.clone());
+    }
+    cache.retain(|(cached, _), _| cached != &identity);
+    cache.insert(key, resolved.clone());
     Ok(resolved)
 }
 
