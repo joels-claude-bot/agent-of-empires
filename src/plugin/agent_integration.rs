@@ -564,15 +564,10 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     let profile = instance.effective_profile();
     let project = std::path::PathBuf::from(&instance.project_path);
     let global_path = crate::session::config::config_path().map_err(|_| ())?;
-    let profile_dir = crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
-    let stamps = vec![
-        stamp(&global_path),
-        stamp(&crate::session::config::state_path().unwrap_or_else(|_| std::path::PathBuf::new())),
-        stamp(&profile_dir.join("config.toml")),
-        stamp(&crate::session::config::repo_config::repo_config_source_path(&project)),
-    ];
+    crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
     let identity = (global_path, profile.clone(), project);
-    let key = (identity.clone(), stamps);
+    let stamps = current_stamps(&identity.0, &identity.1, &identity.2);
+    let key = (identity.clone(), stamps.clone());
 
     {
         let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
@@ -597,14 +592,37 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
 
     let resolved = std::sync::Arc::new(resolved);
     let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    // A concurrent resolver may have inserted a newer snapshot for this identity;
-    // never let a slower older read replace it.
+    // A concurrent resolver may have cached this identity against different file
+    // stamps while this call was loading. Compare the stamps again now that the
+    // lock is held: if the files moved, this snapshot is stale, so serve it to
+    // this caller without displacing the newer entry.
+    if current_stamps(&identity.0, &identity.1, &identity.2) != stamps {
+        return Ok(resolved);
+    }
     if let Some(existing) = cache.get(&key) {
         return Ok(existing.clone());
     }
     cache.retain(|(cached, _), _| cached != &identity);
     cache.insert(key, resolved.clone());
     Ok(resolved)
+}
+
+/// The four config-file stamps for a configuration identity.
+fn current_stamps(
+    global_path: &std::path::Path,
+    profile: &str,
+    project: &std::path::Path,
+) -> Vec<ConfigStamp> {
+    vec![
+        stamp(global_path),
+        stamp(&crate::session::config::state_path().unwrap_or_else(|_| std::path::PathBuf::new())),
+        stamp(
+            &crate::session::get_profile_dir_path(profile)
+                .map(|dir| dir.join("config.toml"))
+                .unwrap_or_default(),
+        ),
+        stamp(&crate::session::config::repo_config::repo_config_source_path(project)),
+    ]
 }
 
 /// Whether an approved integration owns replies. Only a readable configuration
