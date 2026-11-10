@@ -1486,6 +1486,10 @@ api_version = 20
 [[agent_integrations]]
 tool = "prompt-helper"
 command = "prompt-helper"
+
+[[agent_integrations]]
+tool = "omp"
+command = "acme-omp-shim"
 "#;
         let dir = super::super::plugins_dir()
             .unwrap()
@@ -1517,7 +1521,12 @@ command = "prompt-helper"
             cataloged.iter().any(|agent| agent.tool == "prompt-helper"),
             "catalog must keep a declaration whose name only contains the fallback name: {cataloged:?}"
         );
-        // The fallback's own name is still gated until an API 21 launch declaration exists.
+        // An API 20 `omp` entry cannot replace the bundled contract: it stays out
+        // of the catalog and declaration lookup keeps `omp` on the fallback.
+        assert!(
+            !cataloged.iter().any(|agent| agent.tool == "omp"),
+            "an API 20 omp entry must not replace the bundled contract: {cataloged:?}"
+        );
         assert!(declared_agent(registry, "omp", std::iter::empty()).is_none());
     }
 
