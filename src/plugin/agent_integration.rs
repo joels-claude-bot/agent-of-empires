@@ -1512,6 +1512,11 @@ command = "prompt-helper"
 
         // An unrelated tool whose name merely contains `omp` keeps its own declaration.
         assert!(declared_agent(registry.clone(), "prompt-helper", std::iter::empty()).is_some());
+        let cataloged = catalog(&registry, std::iter::empty(), std::iter::empty());
+        assert!(
+            cataloged.iter().any(|agent| agent.tool == "prompt-helper"),
+            "catalog must keep a declaration whose name only contains the fallback name: {cataloged:?}"
+        );
         // The fallback's own name is still gated until an API 21 launch declaration exists.
         assert!(declared_agent(registry, "omp", std::iter::empty()).is_none());
     }
