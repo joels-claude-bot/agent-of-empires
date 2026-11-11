@@ -1734,13 +1734,26 @@ sandbox = "unsupported"
         );
     }
 
-    /// A metadata-only change (`chmod`) must invalidate a warm entry: content,
-    /// mtime and size are unchanged, but a fresh read now fails for the user, so
-    /// ownership must stop granting the cached grant.
+    /// A metadata-only change (`chmod`) must invalidate a warm entry for a
+    /// non-root user: content, mtime and size are unchanged, but a fresh read
+    /// now fails, so ownership must stop granting the cached answer.
     #[test]
     #[serial_test::serial]
     fn a_metadata_only_config_change_invalidates_the_cache() {
         use std::os::unix::fs::PermissionsExt as _;
+
+        /// Restore the original mode even if an assertion panics.
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let path = crate::session::config::config_path().unwrap();
@@ -1756,15 +1769,29 @@ sandbox = "unsupported"
         );
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let readable = stamp(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // The stale grant would still say `Custom`; an unreadable file must not.
+        let _restore = Restore { path: &path, mode };
+        // The stamp must move on mode alone, which is what invalidates the entry.
+        let unreadable = stamp(&path);
+        assert_ne!(
+            readable, unreadable,
+            "the stamp must move on a metadata-only change"
+        );
         let after = custom_ownership(&instance, "wrapped");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        if nix::unistd::geteuid().is_root() {
+            // Root reads a mode-000 file, so the loaded value is legitimately
+            // unchanged; only the stamp guarantee applies here.
+            assert_eq!(after, CustomOwnership::Custom);
+            return;
+        }
         assert_eq!(
             after,
             CustomOwnership::Unavailable,
             "a metadata-only change must invalidate the warm entry, not preserve its grant"
         );
+        drop(_restore);
         // Restored readability resumes the same answer.
         assert_eq!(
             custom_ownership(&instance, "wrapped"),
