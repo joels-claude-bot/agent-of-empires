@@ -1882,7 +1882,12 @@ impl Instance {
         let parsed = super::launch_command::parse_launch_command(command)
             .context(ManagedResumeCause::UnsupportedManagedArguments)?;
         let program = parsed.words.first().context("empty agent command")?;
-        let direct = AGENTS.iter().chain(crate::plugin::bundled_agents::available())
+        // A declaration for this tool hides the bundled fallback from listings,
+        // but a session stored with the fallback's own command still runs it, so
+        // every bundled identity stays resolvable here.
+        let direct = AGENTS
+            .iter()
+            .chain(crate::plugin::bundled_agents::definitions())
             .find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
@@ -1906,7 +1911,9 @@ impl Instance {
                 .file_name()
                 .and_then(|name| name.to_str());
             anyhow::ensure!(
-                !AGENTS.iter().chain(crate::plugin::bundled_agents::available())
+                !AGENTS
+                    .iter()
+                    .chain(crate::plugin::bundled_agents::definitions())
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );

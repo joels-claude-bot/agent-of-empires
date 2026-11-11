@@ -32,6 +32,13 @@ pub(crate) fn definitions() -> impl Iterator<Item = &'static AgentDef<'static>> 
     std::iter::once(&*DEFINITION)
 }
 
+/// The fallback identity for `tool`, even once an approved declaration has
+/// taken over its listing. A session stored with the fallback's own command
+/// keeps that native identity, and its pane detector stays available.
+pub(crate) fn definition(tool: &str) -> Option<&'static AgentDef<'static>> {
+    definitions().find(|agent| agent.name == tool)
+}
+
 pub(crate) fn available() -> impl Iterator<Item = &'static AgentDef<'static>> {
     let registry = super::registry();
     definitions().filter(move |agent| {
