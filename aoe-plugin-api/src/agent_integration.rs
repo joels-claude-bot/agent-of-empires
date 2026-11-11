@@ -17,7 +17,7 @@ pub struct AgentIntegrationContribution {
     /// Enable provider-native prompt replies; status-only adapters leave this disabled.
     #[serde(default)]
     pub replies: bool,
-    /// Requires API 21 and a host that implements agent declarations.
+    /// Requires API 22 and a host that implements agent declarations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<AgentLaunchDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

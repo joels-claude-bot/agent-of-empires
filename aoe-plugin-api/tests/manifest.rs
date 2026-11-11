@@ -45,20 +45,20 @@ fn future_agent_declarations_are_rejected_until_the_host_supports_them() {
         let body = format!(
             "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{declaration}"
         );
-        let errors = invalid(20, &body);
+        let errors = invalid(21, &body);
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("api_version >= 21")),
+                .any(|error| error.contains("api_version >= 22")),
             "{errors:?}"
         );
         assert!(matches!(
-            PluginManifest::from_toml_str(&manifest(21, &body)),
-            Err(ManifestError::UnsupportedApiVersion { found: 21, .. })
+            PluginManifest::from_toml_str(&manifest(22, &body)),
+            Err(ManifestError::UnsupportedApiVersion { found: 22, .. })
         ));
     }
     parse(
-        20,
+        21,
         "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n",
     );
 }
@@ -90,7 +90,7 @@ allow = [{ kind = "named", value = "Enter" }]
 deny = [{ kind = "literal", value = "n" }]
 "#;
     let check = |body: &str| {
-        let parsed: PluginManifest = toml::from_str(&manifest(21, body)).unwrap();
+        let parsed: PluginManifest = toml::from_str(&manifest(22, body)).unwrap();
         match parsed.validate() {
             Err(ManifestError::Invalid(errors)) => errors,
             result => panic!("expected unsupported API version: {result:?}"),
@@ -682,4 +682,82 @@ fn path_icon_and_hash_helpers() {
     assert_eq!(a, PluginManifest::hash_bytes(bytes));
     assert!(a.starts_with("sha256:"));
     assert_ne!(a, PluginManifest::hash_bytes(b"different"));
+}
+
+#[test]
+fn suggestions_require_current_schema_and_worker() {
+    let worker = "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n";
+    let body = format!(
+        "{worker}[suggestions]\n[[suggestions.sources]]\ncriterion = \"review_requested\"\nlabel = \"Review requests\"\nvariables = [\"pr_number\", \"repo\"]\n[[suggestions.sources]]\ncriterion = \"ci_failed\"\nlabel = \"Failing checks\"\ndefault_enabled = false\n"
+    );
+    let spec = parse(21, &body).suggestions.expect("declared");
+    assert_eq!(spec.sources.len(), 2);
+    assert_eq!(spec.sources[0].variables, vec!["pr_number", "repo"]);
+    assert!(spec.sources[0].default_enabled);
+    assert!(!spec.sources[1].default_enabled);
+    assert!(parse(21, "").suggestions.is_none());
+
+    let source = "[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"A\"\n";
+    let long = "x".repeat(257);
+    let cases = [
+        (20, body.clone(), "api_version >= 21"),
+        (
+            21,
+            format!("{worker}[suggestions]\n"),
+            "at least one source",
+        ),
+        (21, source.to_string(), "runtime worker"),
+        (
+            21,
+            format!("[runtime]\nkind = \"command\"\ncommand = [\"./w\"]\n{source}"),
+            "runtime.worker capability",
+        ),
+        (21, format!("{worker}{source}{source}"), "duplicate"),
+        (
+            21,
+            format!("{worker}[[suggestions.sources]]\ncriterion = \"{long}\"\nlabel = \"A\"\n"),
+            "at most 256 bytes",
+        ),
+        (
+            21,
+            format!("{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \" \"\n"),
+            "needs a label",
+        ),
+        (
+            21,
+            format!("{worker}{source}variables = [\"Pr-Number\"]\n"),
+            "[a-z0-9_]+",
+        ),
+        (
+            21,
+            format!("{worker}{source}variables = [\"repo\", \"repo\"]\n"),
+            "duplicate variables",
+        ),
+    ];
+    for (version, body, expected) in cases {
+        assert!(
+            invalid(version, &body).iter().any(|e| e.contains(expected)),
+            "expected {expected:?} for {body:?}"
+        );
+    }
+}
+
+#[test]
+fn suggestion_items_reject_host_owned_fields() {
+    let item = |extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "id":"w", "title":"W", "reason":"r", "source_url":"https://example.com/1",
+            "source_ref":"x", "preview":"p", "criterion":"c",
+            "draft":{"title":"W","prompt":"Do"}
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<aoe_plugin_api::Suggestion>(v)
+    };
+    assert!(item(serde_json::json!({})).is_ok());
+    assert!(item(serde_json::json!({"variables":{"repo":"a/b"}})).is_ok());
+    assert!(item(serde_json::json!({"provider_id":"forged"})).is_err());
+    assert!(!item(serde_json::json!({})).unwrap().stale);
+    assert!(item(serde_json::json!({"stale":true})).unwrap().stale);
 }
