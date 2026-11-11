@@ -1771,44 +1771,61 @@ sandbox = "unsupported"
         );
     }
 
-    /// The cache must stamp the same repo config the loader reads. A worktree
-    /// session resolves that through `repo_config_source_path`, so the stamp has
-    /// to follow it rather than assuming the project directory.
+    /// A linked worktree loads repo config from its main repository. The stamp
+    /// must follow that same resolution, so editing the main repo's config
+    /// invalidates a cache warm from the worktree.
     #[test]
     #[serial_test::serial]
-    fn the_repo_stamp_follows_the_loader_resolution() {
+    fn a_worktree_stamps_the_main_repo_config_it_loads() {
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", temp.path()),
             ("XDG_CONFIG_HOME", temp.path()),
             ("USERPROFILE", temp.path()),
         ]);
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let repo_config_dir = project.join(".agent-of-empires");
+        // A main repo whose `.git` is a directory, per `find_main_repo`.
+        let main = temp.path().join("main-repo");
+        std::fs::create_dir_all(main.join(".git/worktrees/linked")).unwrap();
+        let repo_config_dir = main.join(".agent-of-empires");
         std::fs::create_dir_all(&repo_config_dir).unwrap();
         let repo_config = repo_config_dir.join("config.toml");
         std::fs::write(&repo_config, "[session]\n").unwrap();
 
-        // The loader and the stamp must name one source, not two.
-        let resolved = crate::session::config::repo_config::repo_config_source_path(&project);
+        // A linked worktree points at `<main>/.git/worktrees/linked`.
+        let worktree = temp.path().join("linked-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/linked").display()),
+        )
+        .unwrap();
+
+        // The loader resolves the worktree to the main repo, so must the stamp.
+        let resolved = crate::session::config::repo_config::repo_config_source_path(&worktree);
+        assert_eq!(
+            resolved,
+            main.canonicalize().unwrap_or_else(|_| main.clone()),
+            "a linked worktree must resolve repo config to its main repo"
+        );
         let global = crate::session::config::config_path().unwrap();
         let profile_dir = temp.path().join("profile");
-        let stamps = config_stamps(&global, &profile_dir, &resolved);
-        let repo_stamp = *stamps.last().unwrap();
+        let repo_stamp = *config_stamps(&global, &profile_dir, &resolved)
+            .last()
+            .unwrap();
         assert_eq!(
             repo_stamp,
             stamp(&repo_config),
             "the stamp must watch the file the loader resolves"
         );
 
-        // Editing the loaded file must invalidate the entry.
+        // Editing the main repo's config must invalidate the worktree's entry.
         std::fs::write(&repo_config, "[session]\ncustom_agents = { x = \"y\" }\n").unwrap();
-        let after = config_stamps(&global, &profile_dir, &resolved);
         assert_ne!(
             repo_stamp,
-            *after.last().unwrap(),
-            "editing the loaded repo config must invalidate the cache"
+            *config_stamps(&global, &profile_dir, &resolved)
+                .last()
+                .unwrap(),
+            "editing the main repo config must invalidate a worktree's cache"
         );
     }
 
