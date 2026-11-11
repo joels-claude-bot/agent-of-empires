@@ -531,18 +531,21 @@ fn custom_ownership(instance: &Instance, tool: &str) -> CustomOwnership {
 }
 
 /// Changes to these files invalidate the cached effective configuration.
-type ConfigStamp = Option<(u64, u64, i64, i64, u32)>;
+type ConfigStamp = Option<(u64, u64, i64, i64, i64, i64, u32)>;
 
 fn stamp(path: &std::path::Path) -> ConfigStamp {
     use std::os::unix::fs::MetadataExt;
     // Mode and ctime are part of the stamp: `chmod 000` makes a fresh read fail
-    // for a normal user while mtime stays untouched.
+    // for a normal user while mtime can stay untouched, and a metadata-only
+    // change still moves ctime.
     std::fs::metadata(path).ok().map(|meta| {
         (
             meta.dev(),
             meta.ino(),
             meta.mtime(),
             meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
             meta.mode(),
         )
     })
@@ -1728,6 +1731,43 @@ sandbox = "unsupported"
         assert_eq!(
             owned_status(&instance, false),
             Some((crate::session::Status::Unknown, false))
+        );
+    }
+
+    /// A metadata-only change (`chmod`) must invalidate a warm entry: content,
+    /// mtime and size are unchanged, but a fresh read now fails for the user.
+    #[test]
+    #[serial_test::serial]
+    fn a_metadata_only_config_change_invalidates_the_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let path = crate::session::config::config_path().unwrap();
+        std::fs::write(&path, "[session]\ncustom_agents = { wrapped = \"true\" }\n").unwrap();
+        let mut instance = Instance::new("metadata-invalidation", "/tmp");
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+        // Warm the cache: the readable config selects a custom command.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Custom
+        );
+        let readable = stamp(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = stamp(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        assert_ne!(
+            readable, unreadable,
+            "a metadata-only change must move the stamp so the warm entry is invalidated"
+        );
+        // Same content and mtime, so size cannot carry the difference.
+        assert_eq!(
+            stamp(&path).map(|s| (s.2, s.3)),
+            readable.map(|s| (s.2, s.3)),
+            "the fixture must not change mtime, so the test proves mode/ctime invalidation"
         );
     }
 
