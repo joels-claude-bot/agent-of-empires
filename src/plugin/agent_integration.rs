@@ -1161,6 +1161,92 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn a_launch_only_declaration_keeps_the_fallback_identity_and_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let manifest = r#"
+id = "acme.omp"
+name = "OMP"
+version = "2.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "omp"
+command = "omp-next"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        // The declaration owns new launches, so the listing drops the fallback.
+        assert!(crate::agents::get_agent("omp").is_none());
+        let session = crate::session::config::SessionConfig::default();
+        // A session stored with the fallback's own command keeps its native
+        // identity, which admission, mounts, resume and purge all resolve.
+        let agent = crate::session::Instance::execution_agent_for("omp", "omp", &session)
+            .expect("a stored fallback command keeps its native identity");
+        assert_eq!(agent.name, "omp");
+        assert_eq!(
+            crate::session::config::container_config::resolve_active_agent(
+                "omp",
+                Some("omp"),
+                &session
+            )
+            .map(|agent| agent.name),
+            Some("omp"),
+            "purge and mounts must still resolve the stored fallback"
+        );
+        let roots = crate::session::config::container_config::sandbox_content_roots(
+            "omp",
+            Some("omp"),
+            &session,
+            temp.path(),
+            "11111111-2222-3333-4444-555555555555",
+        )
+        .unwrap();
+        assert!(
+            !roots.is_empty(),
+            "a fresh sandbox must still own its native content roots"
+        );
+        // And the pane detector still sees a running turn, so Smart rename does
+        // not fire its one-shot before the turn finishes.
+        assert_eq!(
+            crate::tmux::detect_status_from_content_in(
+                "",
+                "⠋ Working… ⟦esc⟧\n╭── π ─╮\n╰─ ─╯",
+                "omp"
+            ),
+            crate::session::Status::Running
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn always_yolo_does_not_persist_after_declaration_update() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
