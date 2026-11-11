@@ -1771,6 +1771,47 @@ sandbox = "unsupported"
         );
     }
 
+    /// The cache must stamp the same repo config the loader reads. A worktree
+    /// session resolves that through `repo_config_source_path`, so the stamp has
+    /// to follow it rather than assuming the project directory.
+    #[test]
+    #[serial_test::serial]
+    fn the_repo_stamp_follows_the_loader_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let repo_config_dir = project.join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_config_dir).unwrap();
+        let repo_config = repo_config_dir.join("config.toml");
+        std::fs::write(&repo_config, "[session]\n").unwrap();
+
+        // The loader and the stamp must name one source, not two.
+        let resolved = crate::session::config::repo_config::repo_config_source_path(&project);
+        let global = crate::session::config::config_path().unwrap();
+        let profile_dir = temp.path().join("profile");
+        let stamps = config_stamps(&global, &profile_dir, &resolved);
+        let repo_stamp = *stamps.last().unwrap();
+        assert_eq!(
+            repo_stamp,
+            stamp(&repo_config),
+            "the stamp must watch the file the loader resolves"
+        );
+
+        // Editing the loaded file must invalidate the entry.
+        std::fs::write(&repo_config, "[session]\ncustom_agents = { x = \"y\" }\n").unwrap();
+        let after = config_stamps(&global, &profile_dir, &resolved);
+        assert_ne!(
+            repo_stamp,
+            *after.last().unwrap(),
+            "editing the loaded repo config must invalidate the cache"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn bundled_fallback_gates_only_its_own_tool_name() {
