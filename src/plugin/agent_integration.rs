@@ -531,17 +531,19 @@ fn custom_ownership(instance: &Instance, tool: &str) -> CustomOwnership {
 }
 
 /// Changes to these files invalidate the cached effective configuration.
-type ConfigStamp = Option<(u64, u64, i64, i64, u64)>;
+type ConfigStamp = Option<(u64, u64, i64, i64, u32)>;
 
 fn stamp(path: &std::path::Path) -> ConfigStamp {
     use std::os::unix::fs::MetadataExt;
+    // Mode and ctime are part of the stamp: `chmod 000` makes a fresh read fail
+    // for a normal user while mtime stays untouched.
     std::fs::metadata(path).ok().map(|meta| {
         (
             meta.dev(),
             meta.ino(),
             meta.mtime(),
             meta.mtime_nsec(),
-            meta.size(),
+            meta.mode(),
         )
     })
 }
@@ -564,9 +566,10 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     let profile = instance.effective_profile();
     let project = std::path::PathBuf::from(&instance.project_path);
     let global_path = crate::session::config::config_path().map_err(|_| ())?;
-    crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
-    let identity = (global_path, profile.clone(), project);
-    let stamps = current_stamps(&identity.0, &identity.1, &identity.2);
+    let profile_dir = crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
+    let repo_dir = crate::session::config::repo_config::repo_config_source_path(&project);
+    let identity = (global_path.clone(), profile.clone(), project);
+    let stamps = config_stamps(&global_path, &profile_dir, &repo_dir);
     let key = (identity.clone(), stamps.clone());
 
     {
@@ -581,7 +584,7 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
         let overrides =
             crate::session::config::profile_config::load_profile_config(&profile).ok()?;
         let config = crate::session::config::profile_config::merge_configs(global, &overrides);
-        match crate::session::config::repo_config::load_repo_config(&identity.2).ok()? {
+        match crate::session::config::repo_config::load_repo_config(&repo_dir).ok()? {
             Some(repo) => Some(crate::session::config::repo_config::merge_repo_config(
                 config, &repo,
             )),
@@ -596,7 +599,7 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     // stamps while this call was loading. Compare the stamps again now that the
     // lock is held: if the files moved, this snapshot is stale, so serve it to
     // this caller without displacing the newer entry.
-    if current_stamps(&identity.0, &identity.1, &identity.2) != stamps {
+    if config_stamps(&global_path, &profile_dir, &repo_dir) != stamps {
         return Ok(resolved);
     }
     if let Some(existing) = cache.get(&key) {
@@ -607,21 +610,24 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     Ok(resolved)
 }
 
-/// The four config-file stamps for a configuration identity.
-fn current_stamps(
+/// The config files a session actually reads: the global config, the state file,
+/// the profile override, and the primary or legacy repo config under `repo_dir`.
+fn config_stamps(
     global_path: &std::path::Path,
-    profile: &str,
-    project: &std::path::Path,
+    profile_dir: &std::path::Path,
+    repo_dir: &std::path::Path,
 ) -> Vec<ConfigStamp> {
+    let repo_config = [
+        repo_dir.join(".agent-of-empires/config.toml"),
+        repo_dir.join(".aoe/config.toml"),
+    ]
+    .into_iter()
+    .find(|path| path.exists());
     vec![
         stamp(global_path),
-        stamp(&crate::session::config::state_path().unwrap_or_else(|_| std::path::PathBuf::new())),
-        stamp(
-            &crate::session::get_profile_dir_path(profile)
-                .map(|dir| dir.join("config.toml"))
-                .unwrap_or_default(),
-        ),
-        stamp(&crate::session::config::repo_config::repo_config_source_path(project)),
+        stamp(&crate::session::config::state_path().unwrap_or_default()),
+        stamp(&profile_dir.join("config.toml")),
+        repo_config.as_deref().map(stamp).unwrap_or(None),
     ]
 }
 
@@ -701,15 +707,11 @@ pub(crate) fn owned_status(
     let (tool, plugin) = match provider(&registry, &instance.tool) {
         Ok(Some(plugin)) => (instance.tool.as_str(), Ok(Some(plugin))),
         Ok(None) => match provider(&registry, &alias) {
-            Ok(Some(plugin)) => match custom_ownership(instance, &alias) {
-                CustomOwnership::Plugin => (alias.as_ref(), Ok(Some(plugin))),
-                // The provider establishes the claim; only the report needs the
-                // configuration, so keep it owned but unreadable.
-                CustomOwnership::Unavailable => {
-                    return Some((crate::session::Status::Unknown, false))
-                }
-                CustomOwnership::Custom => return None,
-            },
+            // A `custom_agents` entry names the sessions it applies to, so one for
+            // the alias selects a command for sessions *named* that alias, not for
+            // this differently named session. Alias authority is status-only, and
+            // the own-name collision was already rejected above.
+            Ok(Some(plugin)) => (alias.as_ref(), Ok(Some(plugin))),
             Ok(None) => (instance.tool.as_str(), Ok(None)),
             Err(error) => (instance.tool.as_str(), Err(error)),
         },
@@ -719,7 +721,9 @@ pub(crate) fn owned_status(
         // An unreadable configuration may hide a same-name custom wrapper, so a
         // real claim stays owned-but-unavailable instead of reaching the pane.
         return match plugin {
-            Ok(Some(_)) | Err(_) => Some((crate::session::Status::Unknown, false)),
+            Ok(Some(_)) | Err(_) => {
+                session_status_override(true, pane_dead, None).map(|status| (status, false))
+            }
             Ok(None) => None,
         };
     }
@@ -1657,6 +1661,8 @@ sandbox = "unsupported"
     #[test]
     #[serial_test::serial(hook_base)]
     fn configured_custom_agent_name_owns_no_plugin_status() {
+        // The report lives under the hook base, so isolate it before the temp HOME.
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
         let _env = crate::session::test_support::EnvGuard::set(&[
