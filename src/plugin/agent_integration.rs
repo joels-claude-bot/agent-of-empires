@@ -1735,7 +1735,8 @@ sandbox = "unsupported"
     }
 
     /// A metadata-only change (`chmod`) must invalidate a warm entry: content,
-    /// mtime and size are unchanged, but a fresh read now fails for the user.
+    /// mtime and size are unchanged, but a fresh read now fails for the user, so
+    /// ownership must stop granting the cached grant.
     #[test]
     #[serial_test::serial]
     fn a_metadata_only_config_change_invalidates_the_cache() {
@@ -1747,27 +1748,27 @@ sandbox = "unsupported"
         let mut instance = Instance::new("metadata-invalidation", "/tmp");
         instance.tool = "wrapped".into();
         instance.status = crate::session::Status::Running;
-        // Warm the cache: the readable config selects a custom command.
+        // Warm the cache: the readable config selects a custom command, which
+        // means a plugin must NOT claim the session.
         assert_eq!(
             custom_ownership(&instance, "wrapped"),
             CustomOwnership::Custom
         );
-        let readable = stamp(&path);
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = stamp(&path);
+        // The stale grant would still say `Custom`; an unreadable file must not.
+        let after = custom_ownership(&instance, "wrapped");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-
-        assert_ne!(
-            readable, unreadable,
-            "a metadata-only change must move the stamp so the warm entry is invalidated"
-        );
-        // Same content and mtime, so size cannot carry the difference.
         assert_eq!(
-            stamp(&path).map(|s| (s.2, s.3)),
-            readable.map(|s| (s.2, s.3)),
-            "the fixture must not change mtime, so the test proves mode/ctime invalidation"
+            after,
+            CustomOwnership::Unavailable,
+            "a metadata-only change must invalidate the warm entry, not preserve its grant"
+        );
+        // Restored readability resumes the same answer.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Custom
         );
     }
 
@@ -1800,6 +1801,10 @@ sandbox = "unsupported"
         )
         .unwrap();
 
+        let mut instance = Instance::new("worktree-cache", worktree.to_str().unwrap());
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+
         // The loader resolves the worktree to the main repo, so must the stamp.
         let resolved = crate::session::config::repo_config::repo_config_source_path(&worktree);
         assert_eq!(
@@ -1818,14 +1823,20 @@ sandbox = "unsupported"
             "the stamp must watch the file the loader resolves"
         );
 
-        // Editing the main repo's config must invalidate the worktree's entry.
-        std::fs::write(&repo_config, "[session]\ncustom_agents = { x = \"y\" }\n").unwrap();
-        assert_ne!(
-            repo_stamp,
-            *config_stamps(&global, &profile_dir, &resolved)
-                .last()
-                .unwrap(),
-            "editing the main repo config must invalidate a worktree's cache"
+        // Warm the cache through the real loader.
+        let warm = effective_config(&instance).unwrap();
+        // An unchanged configuration must reuse the cached snapshot.
+        let again = effective_config(&instance).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&warm, &again),
+            "an unchanged configuration must hit the cache"
+        );
+        // Editing the main repo config the worktree loads must reload it.
+        std::fs::write(&repo_config, "# changed\n[session]\n").unwrap();
+        let after = effective_config(&instance).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&warm, &after),
+            "editing the worktree's main repo config must invalidate the cache"
         );
     }
 
