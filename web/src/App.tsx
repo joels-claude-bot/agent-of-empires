@@ -9,7 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Puzzle } from "lucide-react";
+import { Puzzle, Sparkles } from "lucide-react";
 import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -68,6 +68,7 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed } from "./
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
+import { SuggestionsView } from "./components/SuggestionsView";
 import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
@@ -125,7 +126,13 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
+import {
+  NAVIGATE_EVENT,
+  OPEN_SESSION_EVENT,
+  openFocusWindow,
+  replaceDocument,
+  requestNavigate,
+} from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -193,6 +200,7 @@ import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
+import type { CommandAction } from "./components/command-palette/types";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -385,6 +393,7 @@ function AppContent({
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
   useDashboardPresence(focusSessionId);
+  const suggestionsMatch = useMatch("/suggestions");
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
@@ -410,7 +419,7 @@ function AppContent({
   }, [focusMode, onPluginPage, selectPluginPageSession, navigate]);
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
-  const fullPageView = showSettings || pluginPageMatch !== null;
+  const fullPageView = showSettings || pluginPageMatch !== null || suggestionsMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -514,6 +523,17 @@ function AppContent({
   const pluginUiEntries = usePluginUiEntries();
   const pluginPages = usePluginPages();
   const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
+  const suggestionsAction = useMemo<CommandAction>(
+    () => ({
+      id: "page:suggestions",
+      title: "Suggested sessions",
+      group: "Pages",
+      keywords: ["page", "suggestions", "suggested", "start"],
+      icon: <Sparkles className="h-4 w-4" />,
+      perform: () => requestNavigate("/suggestions"),
+    }),
+    [],
+  );
   const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
@@ -1747,6 +1767,15 @@ function AppContent({
     }
   }, [navigate, activeSessionId]);
 
+  const handleSuggestionStarted = useCallback(
+    (session: SessionResponse) => {
+      injectSession(session);
+      navigate(`/session/${encodeURIComponent(session.id)}`);
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    },
+    [injectSession, navigate],
+  );
+
   const handleClosePluginPage = useCallback(() => {
     // A deep link has no in-app history to pop.
     if (location.key !== "default") navigate(-1);
@@ -2285,6 +2314,31 @@ function AppContent({
         />
       );
     }
+    if (suggestionsMatch) {
+      return (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div className="px-4 pt-3 md:px-8">
+            <button onClick={handleClosePluginPage} className="text-brand-500 cursor-pointer text-sm">
+              &larr; Back
+            </button>
+          </div>
+          <SuggestionsView
+            readOnly={serverAbout?.read_only ?? false}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
+            initialDismissed={searchParams.get("dismissed") === "1"}
+            onPrepare={(prefill) => {
+              setWizardPrefill(prefill);
+              setShowSessionWizard(true);
+            }}
+            onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
+            onOpenSettings={() => requestNavigate("/settings/suggestions")}
+            onStarted={handleSuggestionStarted}
+          />
+        </div>
+      );
+    }
     if (showSettings) {
       return (
         <SettingsView
@@ -2310,6 +2364,16 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
+          templateFocus={
+            searchParams.get("template_provider") && searchParams.get("template_criterion")
+              ? {
+                  providerId: searchParams.get("template_provider")!,
+                  criterion: searchParams.get("template_criterion")!,
+                  returnToSuggestions: searchParams.get("from") === "suggestions",
+                }
+              : undefined
+          }
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2368,6 +2432,14 @@ function AppContent({
               />
             )
           }
+          onPrepareSuggestion={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onSuggestionStarted={handleSuggestionStarted}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }
@@ -2748,6 +2820,15 @@ function AppContent({
                 onPluginSortChange={setPluginSortRef}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
+                suggestions={{
+                  onPrepare: (prefill) => {
+                    setWizardPrefill(prefill);
+                    setShowSessionWizard(true);
+                  },
+                  onStarted: handleSuggestionStarted,
+                  onViewAll: () => requestNavigate("/suggestions"),
+                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                }}
               />
             )}
 
@@ -2782,6 +2863,16 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
+              onEditTemplate={({ providerId, criterion }) => {
+                setShowSessionWizard(false);
+                setWizardPrefill(undefined);
+                const q = new URLSearchParams({
+                  template_provider: providerId,
+                  template_criterion: criterion,
+                  from: "suggestions",
+                });
+                navigate(`/settings/suggestions?${q}`);
+              }}
             />
           )}
 
@@ -2864,6 +2955,7 @@ function AppContent({
               ...commandActions,
               ...conversationActions,
               ...pluginPageActions,
+              suggestionsAction,
               ...settingsCommands,
               ...pluginCommandActions,
             ]}
