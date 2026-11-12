@@ -2148,7 +2148,7 @@ pub(crate) fn resolve_active_agent(
         }
         match session_config.agent_detect_as.get(tool) {
             Some(name) => crate::agents::get_agent(name),
-            None => crate::agents::get_agent(tool),
+            None => crate::agents::native_definition(tool),
         }
     })
 }

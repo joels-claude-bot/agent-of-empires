@@ -1885,20 +1885,44 @@ impl Instance {
         // A declaration for this tool hides the bundled fallback from listings,
         // but a session stored with the fallback's own command still runs it, so
         // every bundled identity stays resolvable here.
-        let direct = AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::definitions())
-            .find(|agent| agent.binary == program);
+        let retained = || {
+            AGENTS
+                .iter()
+                .chain(crate::plugin::bundled_agents::definitions())
+        };
+        let direct = retained().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
             .get(tool)
             .map(|name| {
-                crate::agents::get_agent(name)
+                retained()
+                    .find(|agent| agent.name == name)
                     .context("agent_execution_as names an unknown builtin")
             })
             .transpose()?;
+        // A tool's own declaration is its wrapper contract: the declaration
+        // proved the command's direct invocation, so that command runs the
+        // tool's retained native identity and needs no separate namespace.
+        let own_declaration = (direct.is_none() && declared.is_none())
+            .then(|| {
+                crate::plugin::agent_integration::declared_agent(
+                    crate::plugin::registry(),
+                    tool,
+                    config
+                        .custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
+            .flatten()
+            .filter(|declared| declared.contribution().command.as_deref() == Some(command))
+            .and_then(|_| crate::agents::native_definition(tool));
         let logical = crate::agents::get_agent(tool);
-        let actual = direct.or(declared).context(
+        let actual = direct
+            .or(declared)
+            .or(own_declaration)
+            .context(
             "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
             .context(ManagedResumeCause::WrapperContractRequired)?;
         anyhow::ensure!(
@@ -1906,7 +1930,7 @@ impl Instance {
                 && declared.is_none_or(|declared| declared.name == actual.name),
             "agent command contradicts the selected native execution identity"
         );
-        if direct.is_none() {
+        if direct.is_none() && own_declaration.is_none() {
             let basename = std::path::Path::new(program)
                 .file_name()
                 .and_then(|name| name.to_str());
@@ -2895,10 +2919,70 @@ impl Instance {
     }
 }
 
+/// The native option contract a managed conversation follows.
+///
+/// A declaration answers to the contract its capture backend names, so a
+/// plugin's tool label never selects the policy and never selects an absent one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedArgumentPolicy {
+    Claude,
+    Codex,
+    OpenCode,
+    Omp,
+    Prime,
+    Pi,
+    Generic,
+}
+
+fn managed_argument_policy(agent: &AgentDef) -> ManagedArgumentPolicy {
+    use crate::agents::SessionCaptureBackend::{Claude, Codex, Omp, OpenCode, Pi, PrimeAgent};
+    let backend = agent
+        .session_support
+        .and_then(|support| support.capture)
+        .map(|capture| capture.backend);
+    match (backend, agent.name) {
+        (Some(Omp), _) | (_, "omp") => ManagedArgumentPolicy::Omp,
+        (Some(Pi), _) | (_, "pi") => ManagedArgumentPolicy::Pi,
+        (Some(PrimeAgent), _) | (_, "prime-agent") => ManagedArgumentPolicy::Prime,
+        (Some(Codex), _) | (_, "codex") => ManagedArgumentPolicy::Codex,
+        (Some(OpenCode), _) | (_, "opencode") => ManagedArgumentPolicy::OpenCode,
+        (Some(Claude), _) | (_, "claude") => ManagedArgumentPolicy::Claude,
+        _ => ManagedArgumentPolicy::Generic,
+    }
+}
+
+/// The resume contract a recorded binding answers to: whether its identity
+/// declares resume, and the capture backend that identity names.
+fn resume_contract(
+    execution: &ExecutionBinding,
+    own_tool: &str,
+    declared: Option<crate::plugin::agent_integration::DeclaredAgent>,
+) -> (bool, Option<crate::agents::SessionCaptureBackend>) {
+    let contract = |agent: &AgentDef| {
+        (
+            agent.session_support.is_some(),
+            agent
+                .session_support
+                .and_then(|support| support.capture)
+                .map(|capture| capture.backend),
+        )
+    };
+    if let Some(agent) = crate::agents::native_definition(&execution.agent) {
+        return contract(agent);
+    }
+    if execution.agent != own_tool {
+        return (false, None);
+    }
+    declared
+        .and_then(|declared| declared.with_definition(contract))
+        .unwrap_or((false, None))
+}
+
 pub(super) fn validate_managed_arguments(
     agent: &AgentDef,
     words: &[String],
 ) -> Result<Option<String>> {
+    let policy = managed_argument_policy(agent);
     let mut index = 0;
     let mut session_dir = None;
     while index < words.len() {
@@ -2906,8 +2990,8 @@ pub(super) fn validate_managed_arguments(
         let (key, inline) = word
             .split_once('=')
             .map_or((word.as_str(), None), |(key, value)| (key, Some(value)));
-        let (values, switches): (&[&str], &[&str]) = match agent.name {
-            "claude" => (
+        let (values, switches): (&[&str], &[&str]) = match policy {
+            ManagedArgumentPolicy::Claude => (
                 &[
                     "--model",
                     "--fallback-model",
@@ -2923,7 +3007,7 @@ pub(super) fn validate_managed_arguments(
                     "--strict-mcp-config",
                 ],
             ),
-            "codex" => (
+            ManagedArgumentPolicy::Codex => (
                 &[
                     "--model",
                     "-m",
@@ -2944,7 +3028,7 @@ pub(super) fn validate_managed_arguments(
                     "--verbose",
                 ],
             ),
-            "opencode" => (
+            ManagedArgumentPolicy::OpenCode => (
                 &["--model", "-m", "--agent", "--prompt"],
                 &[
                     "--auto",
@@ -2953,7 +3037,7 @@ pub(super) fn validate_managed_arguments(
                     "--verbose",
                 ],
             ),
-            "omp" => (
+            ManagedArgumentPolicy::Omp => (
                 &[
                     "--model",
                     "--thinking",
@@ -2967,7 +3051,7 @@ pub(super) fn validate_managed_arguments(
                 ],
                 &["--yolo", "--dangerously-skip-permissions", "--verbose"],
             ),
-            "prime-agent" => (
+            ManagedArgumentPolicy::Prime => (
                 super::prime_capture::PRIME_VALUE_OPTIONS,
                 &[
                     "--offline",
@@ -2984,7 +3068,7 @@ pub(super) fn validate_managed_arguments(
                     "-nc",
                 ],
             ),
-            "pi" => (
+            ManagedArgumentPolicy::Pi => (
                 &[
                     "--model",
                     "--thinking",
@@ -3002,7 +3086,7 @@ pub(super) fn validate_managed_arguments(
                     "--verbose",
                 ],
             ),
-            _ => (
+            ManagedArgumentPolicy::Generic => (
                 &[
                     "--model",
                     "-m",
@@ -3020,7 +3104,7 @@ pub(super) fn validate_managed_arguments(
                 ],
             ),
         };
-        if agent.name == "claude" && key == "--mcp-config" {
+        if policy == ManagedArgumentPolicy::Claude && key == "--mcp-config" {
             anyhow::ensure!(
                 inline.is_none_or(|value| !value.is_empty() && !value.starts_with('-')),
                 "Claude MCP configuration is missing its value"
@@ -3034,11 +3118,11 @@ pub(super) fn validate_managed_arguments(
             anyhow::ensure!(has_value, "Claude MCP configuration is missing its value");
         } else if values.contains(&key) {
             anyhow::ensure!(
-                agent.name != "prime-agent" || inline.is_none(),
+                policy != ManagedArgumentPolicy::Prime || inline.is_none(),
                 "Prime options require a separate value"
             );
             anyhow::ensure!(
-                agent.name != "pi" || key != "--thinking" || inline.is_none(),
+                policy != ManagedArgumentPolicy::Pi || key != "--thinking" || inline.is_none(),
                 "pi requires --thinking and its value as separate arguments"
             );
             let value = if let Some(value) = inline {
@@ -3049,7 +3133,7 @@ pub(super) fn validate_managed_arguments(
                     .get(index)
                     .context("managed command option is missing its value")?
             };
-            if agent.name == "prime-agent" {
+            if policy == ManagedArgumentPolicy::Prime {
                 let option_text = matches!(key, "--system-prompt" | "--append-system-prompt");
                 let dash_text = matches!(key, "--goal" | "--autonomous-gate");
                 anyhow::ensure!(
@@ -3069,17 +3153,17 @@ pub(super) fn validate_managed_arguments(
             }
             if key == "--session-dir" {
                 anyhow::ensure!(
-                    matches!(agent.name, "pi" | "omp" | "prime-agent")
-                        || agent
-                            .session_support
-                            .and_then(|support| support.capture)
-                            .is_some_and(|capture| capture.backend
-                                == crate::agents::SessionCaptureBackend::Omp),
+                    matches!(
+                        policy,
+                        ManagedArgumentPolicy::Pi
+                            | ManagedArgumentPolicy::Omp
+                            | ManagedArgumentPolicy::Prime
+                    ),
                     "this agent does not support a managed session directory"
                 );
                 session_dir = Some(value.to_owned());
             }
-            if agent.name == "codex" && matches!(key, "--config" | "-c") {
+            if policy == ManagedArgumentPolicy::Codex && matches!(key, "--config" | "-c") {
                 let (setting, _) = value
                     .split_once('=')
                     .context("Codex config requires key=value")?;
@@ -3101,9 +3185,12 @@ pub(super) fn validate_managed_arguments(
         {
         } else if !word.starts_with('-')
             && index + 1 == words.len()
-            && matches!(agent.name, "claude" | "codex")
+            && matches!(
+                policy,
+                ManagedArgumentPolicy::Claude | ManagedArgumentPolicy::Codex
+            )
         {
-            let commands: &[&str] = if agent.name == "claude" {
+            let commands: &[&str] = if policy == ManagedArgumentPolicy::Claude {
                 &[
                     "agents",
                     "attach",
@@ -3304,6 +3391,16 @@ impl Instance {
         self.set_agent_conversation(Some(observation.sid.clone()), binding, pi_session_path);
     }
 
+    /// Whether the binding's own identity declares resume, and the capture
+    /// backend that identity names. A declaration resolves exactly as launch
+    /// authorization does: only the tool this pane declares speaks for it.
+    fn binding_resume_contract(
+        &self,
+        execution: &ExecutionBinding,
+    ) -> (bool, Option<crate::agents::SessionCaptureBackend>) {
+        resume_contract(execution, &self.tool, self.declared_agent())
+    }
+
     pub(crate) fn asserted_resume_binding(
         &self,
         sid: &str,
@@ -3333,13 +3430,19 @@ impl Instance {
                     error.context(context)
                 })
         })?;
+        let (supports_resume, capture_backend) = self.binding_resume_contract(&execution);
         anyhow::ensure!(
-            crate::agents::get_agent(&execution.agent)
-                .is_some_and(|agent| agent.session_support.is_some()),
+            supports_resume,
             "agent does not support exact native resume"
         );
         let mut transcript_path = None;
-        if matches!(execution.agent.as_str(), "pi" | "omp") {
+        if matches!(
+            capture_backend,
+            Some(
+                crate::agents::SessionCaptureBackend::Pi
+                    | crate::agents::SessionCaptureBackend::Omp
+            )
+        ) {
             let file = store.context("recovery requires --store with the exact transcript file")?;
             anyhow::ensure!(
                 !self.is_sandboxed() && file.is_absolute(),
@@ -3367,7 +3470,7 @@ impl Instance {
             transcript_path = Some(file);
         } else if let Some(store) = store {
             anyhow::ensure!(
-                execution.agent.as_str() == "claude",
+                capture_backend == Some(crate::agents::SessionCaptureBackend::Claude),
                 "--store routing is only supported for Claude; other agents resolve their store from configuration"
             );
             anyhow::ensure!(
@@ -4067,8 +4170,8 @@ mod tests {
         assert!(!instance.launch_invokes_resolved_agent_directly(agent));
     }
 
-    #[test]
-    fn declared_omp_backend_uses_generic_tool_and_resume_flag() {
+    /// An OMP-backed declaration whose tool label matches no built-in agent.
+    fn declared_omp_fixture() -> crate::plugin::agent_integration::DeclaredAgent {
         let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
             r#"
 id = "acme.capture"
@@ -4100,12 +4203,56 @@ sandbox = "unsupported"
                 granted: true,
             },
         ]));
-        let declared = crate::plugin::agent_integration::declared_agent(
+        crate::plugin::agent_integration::declared_agent(
             registry,
             "example-helper",
             std::iter::empty(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn declared_binding_answers_to_its_own_declaration() {
+        let binding = |agent: &str| ExecutionBinding {
+            agent: agent.into(),
+            stores: vec![std::path::PathBuf::from("/tmp/store")],
+            configuration: Vec::new(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        let omp = Some(crate::agents::SessionCaptureBackend::Omp);
+        let declared = declared_omp_fixture();
+        assert_eq!(
+            resume_contract(&binding("example-helper"), "example-helper", Some(declared)),
+            (true, omp)
+        );
+        // The bundled identity answers even while a declaration hides it from
+        // listings, so recovery does not depend on which plugin provides OMP.
+        assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
+        // Another tool's binding never inherits this pane's declaration.
+        assert_eq!(
+            resume_contract(
+                &binding("other-helper"),
+                "example-helper",
+                Some(declared_omp_fixture())
+            ),
+            (false, None)
+        );
+        assert_eq!(
+            resume_contract(
+                &binding("claude"),
+                "example-helper",
+                Some(declared_omp_fixture())
+            ),
+            (true, Some(crate::agents::SessionCaptureBackend::Claude))
+        );
+    }
+
+    #[test]
+    fn declared_omp_backend_follows_omp_policy_despite_its_label() {
+        let declared = declared_omp_fixture();
         let mut instance = Instance::new("example", "/tmp");
         instance.tool = "example-helper".into();
         instance.command = "TOKEN=local example-helper --verbose".into();
@@ -4123,6 +4270,22 @@ sandbox = "unsupported"
                     capture.sandbox,
                     crate::agents::SessionCaptureContext::Unsupported
                 );
+                // The capture backend names the CLI contract; the plugin's tool
+                // label selects neither the policy nor the toolkit it admits.
+                for arguments in [
+                    "--profile work",
+                    "--cwd /tmp/project",
+                    "--thinking high",
+                    "--session-dir /tmp/sessions",
+                ] {
+                    let words = shell_words::split(arguments).unwrap();
+                    assert!(
+                        validate_managed_arguments(agent, &words).is_ok(),
+                        "{arguments}"
+                    );
+                }
+                let words = shell_words::split("--settings foreign.json").unwrap();
+                assert!(validate_managed_arguments(agent, &words).is_err());
             })
             .unwrap();
     }

@@ -1196,6 +1196,110 @@ mod tests {
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
     }
 
+    /// Install an approved declaration that provides `omp` through `command`,
+    /// the way the plugin release supersedes the bundled fallback.
+    fn install_omp_declaration(command: &str) {
+        let manifest = format!(
+            r#"
+id = "acme.omp-cutover"
+name = "OMP cutover"
+version = "1.0.0"
+api_version = 21
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "omp"
+command = "{command}"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#
+        );
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp-cutover".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..crate::session::PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    /// A declaration supersedes the bundled OMP listing, but the tool keeps the
+    /// identity its own contract names: the declaration's command still owns
+    /// OMP's store, `agent_execution_as` still names it, and purge still
+    /// reaches the certified store.
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_keeps_the_identity_its_stores_and_wrappers_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        install_omp_declaration("omp-next");
+        let resolve =
+            |tool: &str, command: &str, session: &crate::session::config::SessionConfig| {
+                crate::session::config::container_config::resolve_active_agent(
+                    tool,
+                    Some(command),
+                    session,
+                )
+                .map(|agent| agent.name)
+            };
+        let default = crate::session::config::SessionConfig::default();
+        assert_eq!(resolve("omp", "omp-next", &default), Some("omp"));
+        let mut wrapper = crate::session::config::SessionConfig::default();
+        wrapper
+            .agent_execution_as
+            .insert("wrapper".into(), "omp".into());
+        wrapper
+            .agent_config_dir
+            .insert("wrapper".into(), "~/.wrapper".into());
+        assert_eq!(resolve("wrapper", "wrapper-next", &wrapper), Some("omp"));
+
+        let mut instance = crate::session::Instance::new("t", "/tmp/p");
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.sandbox_store_generation =
+            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+        let store = dir
+            .path()
+            .join(".omp")
+            .join("sandbox-v2")
+            .join(&instance.id);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("owned"), b"owned").unwrap();
+        content::certify_owned_test_root(
+            &crate::session::get_app_dir().unwrap(),
+            &instance.id,
+            &store,
+        )
+        .unwrap();
+        let (removed, _) =
+            remove_stores_for(&instance, &crate::session::config::Config::default()).unwrap();
+        assert_eq!(removed, vec![store.clone()]);
+        assert!(!store.exists(), "the certified store was left behind");
+    }
+
     /// Removing one store takes time, and a container for a later candidate
     /// can appear while it happens. Evidence has to be re-taken per candidate,
     /// not once for the loop.
