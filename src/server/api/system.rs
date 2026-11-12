@@ -319,6 +319,13 @@ pub async fn list_agents(
                 .map(|(name, _)| name.as_str()),
         );
         for integration in plugin_agents {
+            // A host-owned adapter outlives the takeover: `omp acp` is still
+            // registered even while a declaration provides the tool, so the row
+            // keeps the adapter fields the builtin row would report. A plugin
+            // naming any other tool has no registry entry and grants nothing.
+            let (acp_command, acp_args) =
+                acp_command_fields(acp_registry.get(integration.tool), data_dir.as_deref());
+            let acp_capable = acp_registry.get(integration.tool).is_some();
             let launch = registry
                 .get(integration.plugin)
                 .and_then(|owner| {
@@ -365,12 +372,12 @@ pub async fn list_agents(
                 oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some())
                     && aoe_plugin_api::agent_integration::direct_launch_words(integration.command)
                         .is_some(),
-                acp_capable: false,
+                acp_capable,
                 acp_installed: false,
                 acp_create_ready: false,
                 acp_allowed: policy.allows(integration.tool),
-                acp_command: None,
-                acp_args: Vec::new(),
+                acp_command,
+                acp_args,
                 lifecycle: crate::agents::AgentLifecycle::Active,
             });
         }

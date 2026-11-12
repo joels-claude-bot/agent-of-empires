@@ -1885,20 +1885,44 @@ impl Instance {
         // A declaration for this tool hides the bundled fallback from listings,
         // but a session stored with the fallback's own command still runs it, so
         // every bundled identity stays resolvable here.
-        let direct = AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::definitions())
-            .find(|agent| agent.binary == program);
+        let retained = || {
+            AGENTS
+                .iter()
+                .chain(crate::plugin::bundled_agents::definitions())
+        };
+        let direct = retained().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
             .get(tool)
             .map(|name| {
-                crate::agents::get_agent(name)
+                retained()
+                    .find(|agent| agent.name == name)
                     .context("agent_execution_as names an unknown builtin")
             })
             .transpose()?;
+        // A tool's own declaration is its wrapper contract: the declaration
+        // proved the command's direct invocation, so that command runs the
+        // tool's retained native identity and needs no separate namespace.
+        let own_declaration = (direct.is_none() && declared.is_none())
+            .then(|| {
+                crate::plugin::agent_integration::declared_agent(
+                    crate::plugin::registry(),
+                    tool,
+                    config
+                        .custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
+            .flatten()
+            .filter(|declared| declared.contribution().command.as_deref() == Some(command))
+            .and_then(|_| crate::agents::native_definition(tool));
         let logical = crate::agents::get_agent(tool);
-        let actual = direct.or(declared).context(
+        let actual = direct
+            .or(declared)
+            .or(own_declaration)
+            .context(
             "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
             .context(ManagedResumeCause::WrapperContractRequired)?;
         anyhow::ensure!(
@@ -1906,7 +1930,7 @@ impl Instance {
                 && declared.is_none_or(|declared| declared.name == actual.name),
             "agent command contradicts the selected native execution identity"
         );
-        if direct.is_none() {
+        if direct.is_none() && own_declaration.is_none() {
             let basename = std::path::Path::new(program)
                 .file_name()
                 .and_then(|name| name.to_str());
@@ -2943,7 +2967,7 @@ fn resume_contract(
                 .map(|capture| capture.backend),
         )
     };
-    if let Some(agent) = crate::agents::get_agent(&execution.agent) {
+    if let Some(agent) = crate::agents::native_definition(&execution.agent) {
         return contract(agent);
     }
     if execution.agent != own_tool {
@@ -4204,6 +4228,9 @@ sandbox = "unsupported"
             resume_contract(&binding("example-helper"), "example-helper", Some(declared)),
             (true, omp)
         );
+        // The bundled identity answers even while a declaration hides it from
+        // listings, so recovery does not depend on which plugin provides OMP.
+        assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
         // Another tool's binding never inherits this pane's declaration.
         assert_eq!(
             resume_contract(

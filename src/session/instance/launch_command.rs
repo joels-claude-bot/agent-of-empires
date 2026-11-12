@@ -1257,7 +1257,7 @@ impl Instance {
                     let appends_flag = self.is_yolo_mode()
                         && declared
                             .with_definition(|agent| {
-                                yolo_flag_needs_direct_launch(command, agent.yolo.as_ref())
+                                yolo_flag_needs_direct_launch(&command, agent.yolo.as_ref())
                             })
                             .unwrap_or(false);
                     anyhow::ensure!(
