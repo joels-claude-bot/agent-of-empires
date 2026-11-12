@@ -556,8 +556,14 @@ fn stamp(path: &std::path::Path) -> ConfigStamp {
     // Entry presence is stamped separately from target metadata: `chmod 000`
     // makes a fresh read fail while mtime can stay untouched, so mode and ctime
     // are part of it, and a dangling symlink has no target metadata to stamp.
-    if std::fs::symlink_metadata(path).is_err() {
-        return ConfigStamp::Absent;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ConfigStamp::Absent;
+        }
+        // A denied directory hides whether the reader's file exists at all, so
+        // it must not share `Absent`'s key with a deleted file.
+        Err(_) => return ConfigStamp::Unreadable,
     }
     match std::fs::metadata(path) {
         Ok(meta) => ConfigStamp::Readable {
@@ -637,6 +643,22 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
 
 /// The config files a session actually reads: the global config, the state file,
 /// the profile override, and the primary or legacy repo config under `repo_dir`.
+/// The repo config the reader selects, stamped by directory entry: an entry that
+/// cannot be inspected is unreadable, never absent.
+fn repo_config_stamp(repo_dir: &std::path::Path) -> ConfigStamp {
+    for path in [
+        repo_dir.join(".agent-of-empires/config.toml"),
+        repo_dir.join(".aoe/config.toml"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return stamp(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return ConfigStamp::Unreadable,
+        }
+    }
+    ConfigStamp::Absent
+}
+
 fn config_stamps(
     global_path: &std::path::Path,
     profile_dir: &std::path::Path,
@@ -644,17 +666,11 @@ fn config_stamps(
 ) -> Vec<ConfigStamp> {
     // Selected by directory entry, as the reader selects it: a dangling primary
     // is attempted rather than skipped for the legacy path.
-    let repo_config = [
-        repo_dir.join(".agent-of-empires/config.toml"),
-        repo_dir.join(".aoe/config.toml"),
-    ]
-    .into_iter()
-    .find(|path| std::fs::symlink_metadata(path).is_ok());
     vec![
         stamp(global_path),
         stamp(&crate::session::config::state_path().unwrap_or_default()),
         stamp(&profile_dir.join("config.toml")),
-        repo_config.as_deref().map_or(ConfigStamp::Absent, stamp),
+        repo_config_stamp(repo_dir),
     ]
 }
 
@@ -724,9 +740,11 @@ pub(crate) fn owned_status(
     let own = custom_ownership(instance, &instance.tool);
     let own_claim = provider(&registry, &instance.tool);
     // A same-name custom wrapper is a different program from the declaration,
-    // so a plugin claiming this session's own name has no report to give. A
+    // so a plugin claiming this session's own name has no report to give. An
+    // ambiguous claim is excluded too: the wrapper is readable and known, so it
+    // keeps its pane rules rather than reading as plugin-owned `Unknown`. A
     // wrapper detected as another provider still answers through that alias.
-    if own == CustomOwnership::Custom && matches!(&own_claim, Ok(Some(_))) {
+    if own == CustomOwnership::Custom && !matches!(&own_claim, Ok(None)) {
         return None;
     }
     let alias = crate::tmux::status_rules::detection_tool(
@@ -1872,6 +1890,50 @@ sandbox = "unsupported"
         assert!(declared_agent(registry, "shadow-agent", std::iter::empty()).is_none());
     }
 
+    /// Two approved providers make the own-name claim ambiguous. A readable
+    /// custom selection still owns its program, so ambiguity must not hand it to
+    /// the plugins and report `Unknown` over the wrapper's pane rules.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn an_ambiguous_claim_does_not_take_a_configured_custom_program() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-ambiguous");
+        install_test_integration("acme.ambiguous-one", "shadow-agent");
+        install_test_integration("acme.ambiguous-two", "shadow-agent");
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+        assert!(
+            provider(&registry, "shadow-agent").is_err(),
+            "the fixture must present an ambiguous claim"
+        );
+
+        let mut instance = Instance::new("custom-ambiguous", "/tmp");
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "custom-ambiguous".into();
+        instance.status = crate::session::Status::Running;
+
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Custom
+        );
+        assert_eq!(owned_status(&instance, false), None);
+        assert!(!replies_configured(&instance));
+    }
+
     /// A configured wrapper is its own program, but a session detected as
     /// another provider still reads that provider's report. Only the own-name
     /// declaration collision voids the claim.
@@ -2045,6 +2107,69 @@ sandbox = "unsupported"
         assert!(
             effective_config(&instance).is_err(),
             "a dangling repo config must not reuse the warm grant"
+        );
+    }
+
+    /// A warm `Absent` profile override must not survive its directory becoming
+    /// unsearchable: the reader then rejects the path, so absence cannot share
+    /// the key that keeps the cached grant.
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_profile_directory_invalidates_a_warm_absent_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let mut instance = Instance::new("unreadable-profile", "/tmp");
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+        let profile_dir =
+            crate::session::get_profile_dir_path(&instance.effective_profile()).unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let config = profile_dir.join("config.toml");
+        assert!(!config.exists());
+        // Warm the cache with no profile override present at all.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Plugin
+        );
+
+        let mode = std::fs::metadata(&profile_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let absent = stamp(&config);
+        std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore {
+            path: &profile_dir,
+            mode,
+        };
+        assert_ne!(
+            absent,
+            stamp(&config),
+            "a denied directory must not stamp as an absent file"
+        );
+
+        if nix::unistd::geteuid().is_root() {
+            // Root reads through the mode, so only the stamp guarantee applies.
+            return;
+        }
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Unavailable,
+            "the cached grant must not outlive an unreadable configuration"
         );
     }
 
