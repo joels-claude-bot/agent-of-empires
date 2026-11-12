@@ -498,15 +498,13 @@ impl Instance {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
-        if crate::agents::get_agent(&active.binding.agent).is_none() {
+        let Some(native) = crate::agents::native_definition(&active.binding.agent) else {
             if active.binding.agent != self.tool {
                 return None;
             }
             return self.declared_session_support(active.container.is_some());
-        }
-        let capture = crate::agents::get_agent(&active.binding.agent)?
-            .session_support?
-            .capture?;
+        };
+        let capture = native.session_support?.capture?;
         let context = if active.container.is_some() {
             capture.sandbox
         } else {
@@ -1004,6 +1002,43 @@ pub(crate) fn resolved_agent_for(
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// A session stored with the fallback's own command keeps its capture after
+    /// an approved declaration takes over the OMP listing.
+    #[test]
+    #[serial_test::serial]
+    fn recorded_native_omp_identity_keeps_its_capture_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let mut instance = Instance::new("recorded", dir.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.active_execution = Some(crate::session::instance::execution::ActiveExecution {
+            launch_id: "fixture-launch".into(),
+            binding: crate::session::instance::execution::ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec![dir.path().join(".omp")],
+                configuration: Vec::new(),
+                cwd: dir.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        });
+
+        let (capture, context) = instance
+            .source_session_support()
+            .expect("a recorded native omp execution keeps its capture");
+        assert_eq!(capture.backend, crate::agents::SessionCaptureBackend::Omp);
+        assert_eq!(context, crate::agents::SessionCaptureContext::PaneScoped);
+    }
 
     fn worktree(main_repo_path: &str) -> WorktreeInfo {
         WorktreeInfo {

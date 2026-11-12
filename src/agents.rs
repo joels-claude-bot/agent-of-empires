@@ -1543,7 +1543,7 @@ pub fn terminal_tool_for_acp_agent(agent: &str) -> Option<&'static str> {
     } else {
         agent
     };
-    get_agent(tool).map(|def| def.name)
+    native_definition(tool).map(|def| def.name)
 }
 
 /// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
@@ -1811,6 +1811,22 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structured session on the host OMP adapter can return to its terminal
+    /// while a declaration holds the listing; unknown identities still cannot.
+    #[test]
+    #[serial_test::serial]
+    fn acp_terminal_tool_resolves_retained_identities_but_not_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+
+        assert!(get_agent("omp").is_none());
+        assert_eq!(terminal_tool_for_acp_agent("omp"), Some("omp"));
+        assert_eq!(terminal_tool_for_acp_agent("not-a-tool"), None);
+    }
 
     #[cfg(unix)]
     #[test]

@@ -4414,6 +4414,59 @@ sandbox = "unsupported"
             .is_err());
     }
 
+    /// Recovery resolves the declaration itself, not the fallback listing that
+    /// an approved takeover hides.
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_recovery_survives_a_hidden_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp-next",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "22222222-3333-4444-8555-666666666666";
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let transcript = store.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+        )
+        .unwrap();
+
+        let mut instance = Instance::new("hidden-fallback", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.extra_args = format!(
+            "--session-dir {}",
+            crate::session::environment::shell_escape(store.to_str().unwrap())
+        );
+
+        let binding = instance
+            .asserted_resume_binding(sid, Some(&transcript))
+            .expect("recovery still binds while the fallback is hidden");
+        assert_eq!(binding.session_id, sid);
+    }
+
     #[test]
     fn prime_native_options_preserve_managed_namespace_admission() {
         let temp = tempfile::tempdir().unwrap();
@@ -5005,6 +5058,7 @@ sandbox = "unsupported"
     }
 
     #[test]
+    #[serial_test::serial]
     fn managed_verbose_flag_is_allowed_without_namespace_effect() {
         for name in ["claude", "codex", "opencode", "omp", "prime-agent", "kimi"] {
             let agent = crate::agents::get_agent(name).unwrap();
