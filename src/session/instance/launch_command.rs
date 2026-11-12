@@ -71,15 +71,23 @@ fn resolved_yolo<'a>(
     }
 }
 
-/// Whether appending the agent's YOLO flag would land it on a shell operator
-/// rather than the agent, because the command is not a plain invocation. An
-/// environment-variable mode prefixes the command and stays inside it.
-fn yolo_flag_needs_direct_launch(
-    command: &str,
-    yolo: Option<&crate::agents::YoloMode<'_>>,
-) -> bool {
-    matches!(yolo, Some(crate::agents::YoloMode::CliFlag(_)))
-        && aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
+/// Whether a declaration-derived argument appended to `command` would land on a
+/// shell operator instead of the agent, because the command is not a plain
+/// invocation. Every such argument is positional argv for the agent.
+fn declared_args_need_direct_launch(command: &str) -> bool {
+    aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
+}
+
+/// Refuse an argument AoE appends for the agent when the command is not a plain
+/// invocation, because the shell would consume it before the agent sees it.
+fn refuse_shell_consumed_argument(command: &str, argument: &str) -> Result<()> {
+    anyhow::ensure!(
+        !declared_args_need_direct_launch(command),
+        "`{}` is not a plain invocation, so the agent's {} would reach the shell instead of the agent; declare the bare agent invocation",
+        command,
+        argument
+    );
+    Ok(())
 }
 
 fn prime_runtime_for_capture(
@@ -128,9 +136,19 @@ fn wrap_prime_launch(
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
-fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
+///
+/// `supplied` is the command as the user or declaration wrote it, before AoE
+/// renders and pins it: the refusal is about that text, never about the quoting
+/// AoE's own rendering adds for a path.
+fn apply_yolo_mode(
+    cmd: &mut String,
+    yolo: &crate::agents::YoloMode,
+    is_sandboxed: bool,
+    supplied: &str,
+) -> Result<()> {
     match yolo {
         crate::agents::YoloMode::CliFlag(flag) => {
+            refuse_shell_consumed_argument(supplied, "mode flag")?;
             *cmd = format!("{} {}", cmd, flag);
         }
         crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
@@ -140,6 +158,7 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
         | crate::agents::YoloMode::AlwaysYolo
         | crate::agents::YoloMode::EitherGeneration { .. } => {}
     }
+    Ok(())
 }
 
 /// Format an environment variable assignment as a shell-safe command prefix.
@@ -1253,19 +1272,6 @@ impl Instance {
                     self.command.is_empty()
                         || agent.contribution().command.as_deref() == Some(self.command.as_str())
                 }) {
-                    let command = self.get_tool_command();
-                    let appends_flag = self.is_yolo_mode()
-                        && declared
-                            .with_definition(|agent| {
-                                yolo_flag_needs_direct_launch(&command, agent.yolo.as_ref())
-                            })
-                            .unwrap_or(false);
-                    anyhow::ensure!(
-                        !appends_flag,
-                        "declared agent {} declares shell syntax in its command `{}`, so appending its YOLO flag would reach the shell instead of the agent; declare the bare agent invocation",
-                        self.tool,
-                        command
-                    );
                     return declared
                         .with_definition(|agent| {
                             self.build_launch_command_for_agent_in(
@@ -1399,6 +1405,7 @@ impl Instance {
             let mut tool_cmd = if self.is_yolo_mode() {
                 match yolo {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
+                        refuse_shell_consumed_argument(&base_cmd, "mode flag")?;
                         format!("{} {}", base_cmd, flag)
                     }
                     Some(crate::agents::YoloMode::EnvVar(..))
@@ -1416,6 +1423,7 @@ impl Instance {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
+                    refuse_shell_consumed_argument(&tool_cmd, "instruction flag")?;
                     let escaped = shell_escape(instruction);
                     let flag = flag_template.replace("{}", &escaped);
                     tool_cmd = format!("{} {}", tool_cmd, flag);
@@ -1651,8 +1659,9 @@ impl Instance {
         if self.command.is_empty() {
             match agent {
                 Some(a) => {
+                    let supplied = a.launch_base_command();
                     let mut cmd = self.freeze_native_invocation(
-                        a.launch_base_command(),
+                        supplied.clone(),
                         execution,
                         unpinned,
                         launch_context,
@@ -1672,7 +1681,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false);
+                            apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                         }
                     }
                     let is_existing = self.apply_session_flags_in(
@@ -1695,7 +1704,7 @@ impl Instance {
                             if let Some(yolo) =
                                 agent.and_then(|agent| resolved_yolo(agent, launch_context))
                             {
-                                apply_yolo_mode(&mut cmd, yolo, false);
+                                apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                             }
                         }
                     }
@@ -1757,8 +1766,9 @@ impl Instance {
                 }),
             }
         } else {
+            let supplied = self.command.clone();
             let mut cmd = self.freeze_native_invocation(
-                self.command.clone(),
+                supplied.clone(),
                 execution,
                 unpinned,
                 launch_context,
@@ -1771,7 +1781,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false);
+                    apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                 }
             }
             let is_existing = self.apply_session_flags_in(
@@ -1793,7 +1803,7 @@ impl Instance {
                 if !defer_yolo && self.is_yolo_mode() {
                     if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
                     {
-                        apply_yolo_mode(&mut cmd, yolo, false);
+                        apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                     }
                 }
             }
@@ -1853,27 +1863,285 @@ mod tests {
     use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
 
+    /// Installs launch-only declarations whose commands carry shell syntax, so a
+    /// declared instruction or YOLO flag would land on the shell.
+    fn install_shell_syntax_declarations() {
+        let manifest = r#"
+id = "acme.shell-syntax"
+name = "Shell syntax"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "zzalpha"
+command = "prime-agent | tee log"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzbeta"
+command = "prime-agent # trailing"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzgamma"
+command = "prime-agent"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzdelta"
+command = "prime-agent | tee log"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+
+[[agent_integrations]]
+tool = "zzepsilon"
+command = "prime-agent"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.shell-syntax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.shell-syntax".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    /// The mode flag is argv for the agent, so a shell-consumed supplied command
+    /// must be refused. AoE's own rendering quotes a resolved program path, and
+    /// that quoting is not the user's: it must not trip the refusal.
     #[test]
-    fn yolo_flag_requires_a_direct_agent_invocation() {
-        let flag = crate::agents::YoloMode::CliFlag("--yolo");
-        let env = crate::agents::YoloMode::EnvVar("AOE_TEST_PERMISSION", "allow");
-        for (command, yolo, needs) in [
-            ("helper --verbose", &flag, false),
-            ("TOKEN=local helper", &flag, false),
-            ("helper | tee /tmp/helper.log", &flag, true),
-            ("helper; echo done", &flag, true),
-            ("helper > /tmp/helper.log", &flag, true),
-            ("helper # trailing", &flag, true),
+    fn the_mode_flag_guards_the_supplied_command_not_the_rendered_one() {
+        let mut rendered = "'/tmp/bin=tag/opencode' --standalone".to_owned();
+        apply_yolo_mode(
+            &mut rendered,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode",
+        )
+        .expect("a rendered program path must not read as shell syntax");
+        assert_eq!(rendered, "'/tmp/bin=tag/opencode' --standalone --yolo");
+
+        let mut plain = "opencode".to_owned();
+        let error = apply_yolo_mode(
+            &mut plain,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode | tee log",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{error}"
+        );
+        assert_eq!(plain, "opencode", "a refused flag must not be appended");
+    }
+
+    /// A packaged (sandboxed) launch appends the configured instruction to the
+    /// declared command. That argument is argv for the agent, so a pipeline or a
+    /// comment in the declared command must be refused instead of handing the
+    /// instruction to the shell; a bare command still receives it.
+    #[test]
+    #[serial_test::serial]
+    fn declared_instruction_requires_a_direct_sandbox_command() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_shell_syntax_declarations();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let declared = |tool: &str, command: &str| {
+            let mut inst = Instance::new(tool, project.to_str().unwrap());
+            inst.tool = tool.into();
+            inst.command = command.into();
+            inst.source_profile = "declared-shell".into();
+            let mut sandbox = test_sandbox(tool, Some("/workspace/project"));
+            sandbox.custom_instruction = Some("hello".into());
+            inst.sandbox_info = Some(sandbox);
+            inst
+        };
+
+        for tool in ["zzalpha", "zzbeta"] {
+            let command = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                tool,
+                std::iter::empty(),
+            )
+            .expect("the declaration is installed")
+            .contribution()
+            .command
+            .clone()
+            .expect("the declaration names its command");
+            let mut inst = declared(tool, &command);
+            // Host runtimes differ: without the fixture the runtime lookup fails
+            // on a runner that has no container runtime, before the append.
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = install_container_transport(temp.path(), tool, &config.volumes);
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(_) => panic!("a shell command must not receive the declared instruction"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("reach the shell instead of the agent"),
+                "{tool} `{command}`: {error}"
+            );
+        }
+
+        // YOLO off and a bare command: the instruction is appended as argv. The
+        // transport is fixtures so the launch does not depend on a host runtime.
+        let mut direct = declared("zzgamma", "prime-agent");
+        let config = direct.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--prompt="),
+            "the direct command must receive the instruction"
+        );
+    }
+
+    /// The host launch appends the same declaration-derived arguments as the
+    /// packaged one, and they are argv for the agent. A pipeline in the declared
+    /// command would hand the mode flag to the shell, so the guard holds on the
+    /// host path too while a bare command still takes it. Resume flags need no
+    /// guard here: a command that hides the agent behind a launcher already
+    /// starts fresh instead of injecting a selector.
+    #[test]
+    #[serial_test::serial]
+    fn declared_host_launch_refuses_arguments_the_shell_would_consume() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_shell_syntax_declarations();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let declared = |tool: &str| {
+            let command = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                tool,
+                std::iter::empty(),
+            )
+            .expect("the declaration is installed")
+            .contribution()
+            .command
+            .clone()
+            .expect("the declaration names its command");
+            let mut inst = Instance::new(tool, project.to_str().unwrap());
+            inst.tool = tool.into();
+            inst.command = command.clone();
+            inst.source_profile = "declared-shell".into();
+            (inst, command)
+        };
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.yolo_mode = true;
+        let error = match piped.prepare_launch_command(piped.conversation_state()) {
+            Err(error) => error,
+            Ok(prepared) => panic!(
+                "a host pipeline must not receive the mode flag: {:?}",
+                prepared.command
+            ),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{command}: {error}"
+        );
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.set_agent_conversation(Some("4f6f3a52".into()), None, None);
+        let prepared = piped
+            .prepare_launch_command(piped.conversation_state())
+            .expect("a launcher-hidden command launches without a resume selector");
+        assert!(
+            !prepared.command.unwrap().contains("--resume"),
+            "{command} must not receive a resume flag the shell would consume"
+        );
+
+        let (mut direct, _) = declared("zzepsilon");
+        direct.yolo_mode = true;
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--yolo"),
+            "the direct command must receive the mode flag"
+        );
+    }
+
+    #[test]
+    fn declared_arguments_require_a_direct_agent_invocation() {
+        for (command, needs) in [
+            ("helper --verbose", false),
             // A prefix stays inside the pipeline's first command.
-            ("helper | tee /tmp/helper.log", &env, false),
+            ("TOKEN=local helper", false),
+            ("helper | tee /tmp/helper.log", true),
+            ("helper; echo done", true),
+            ("helper > /tmp/helper.log", true),
+            ("helper # trailing", true),
         ] {
             assert_eq!(
-                yolo_flag_needs_direct_launch(command, Some(yolo)),
+                declared_args_need_direct_launch(command),
                 needs,
                 "{command}"
             );
         }
-        assert!(!yolo_flag_needs_direct_launch("helper | tee", None));
     }
 
     #[test]

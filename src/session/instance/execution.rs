@@ -2935,18 +2935,31 @@ enum ManagedArgumentPolicy {
 }
 
 fn managed_argument_policy(agent: &AgentDef) -> ManagedArgumentPolicy {
-    use crate::agents::SessionCaptureBackend::{Claude, Codex, Omp, OpenCode, Pi, PrimeAgent};
+    use crate::agents::SessionCaptureBackend::{
+        Claude, Codex, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi, PrimeAgent,
+    };
     let backend = agent
         .session_support
         .and_then(|support| support.capture)
         .map(|capture| capture.backend);
-    match (backend, agent.name) {
-        (Some(Omp), _) | (_, "omp") => ManagedArgumentPolicy::Omp,
-        (Some(Pi), _) | (_, "pi") => ManagedArgumentPolicy::Pi,
-        (Some(PrimeAgent), _) | (_, "prime-agent") => ManagedArgumentPolicy::Prime,
-        (Some(Codex), _) | (_, "codex") => ManagedArgumentPolicy::Codex,
-        (Some(OpenCode), _) | (_, "opencode") => ManagedArgumentPolicy::OpenCode,
-        (Some(Claude), _) | (_, "claude") => ManagedArgumentPolicy::Claude,
+    if let Some(backend) = backend {
+        return match backend {
+            Omp => ManagedArgumentPolicy::Omp,
+            Pi => ManagedArgumentPolicy::Pi,
+            PrimeAgent => ManagedArgumentPolicy::Prime,
+            Codex => ManagedArgumentPolicy::Codex,
+            OpenCode => ManagedArgumentPolicy::OpenCode,
+            Claude => ManagedArgumentPolicy::Claude,
+            Gemini | HookSidecar | Hermes | Kimi => ManagedArgumentPolicy::Generic,
+        };
+    }
+    match agent.name {
+        "omp" => ManagedArgumentPolicy::Omp,
+        "pi" => ManagedArgumentPolicy::Pi,
+        "prime-agent" => ManagedArgumentPolicy::Prime,
+        "codex" => ManagedArgumentPolicy::Codex,
+        "opencode" => ManagedArgumentPolicy::OpenCode,
+        "claude" => ManagedArgumentPolicy::Claude,
         _ => ManagedArgumentPolicy::Generic,
     }
 }
@@ -4290,6 +4303,171 @@ sandbox = "unsupported"
             .unwrap();
     }
 
+    /// Installs an OMP-backed declaration for `example-helper` in the isolated
+    /// app directory, so the global registry resolves it.
+    fn install_declared_omp_plugin() {
+        let manifest = r#"
+id = "acme.capture"
+name = "Capture"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "example-helper"
+command = "example-helper"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+"#;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.capture");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.capture".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_recovery_binds_its_own_store_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "example-helper",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        install_declared_omp_plugin();
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let header = format!("{}\n", serde_json::json!({"type": "session", "id": sid}));
+        let transcript = store.join("transcript.jsonl");
+        std::fs::write(&transcript, &header).unwrap();
+
+        let mut instance = Instance::new("declared-recovery", project.to_str().unwrap());
+        instance.tool = "example-helper".into();
+        instance.command = "example-helper".into();
+        instance.extra_args = format!(
+            "--session-dir {}",
+            crate::session::environment::shell_escape(store.to_str().unwrap())
+        );
+
+        let binding = instance
+            .asserted_resume_binding(sid, Some(&transcript))
+            .expect("a declared OMP tool accepts a transcript in its own store");
+        assert_eq!(binding.session_id, sid);
+        assert_eq!(
+            binding.transcript_path.as_deref(),
+            Some(transcript.canonicalize().unwrap().as_path())
+        );
+
+        // Only the Pi/OMP branch compares the transcript against the store.
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, &header).unwrap();
+        let error = instance
+            .asserted_resume_binding(sid, Some(&outside))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("outside the configured store"),
+            "{error}"
+        );
+
+        // A sandboxed session has no host execution identity to bind a store to.
+        instance.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(
+            "declared-recovery",
+            None,
+        ));
+        assert!(instance
+            .asserted_resume_binding(sid, Some(&transcript))
+            .is_err());
+    }
+
+    /// Recovery resolves the declaration itself, not the fallback listing that
+    /// an approved takeover hides.
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_recovery_survives_a_hidden_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp-next",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "22222222-3333-4444-8555-666666666666";
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let transcript = store.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+        )
+        .unwrap();
+
+        let mut instance = Instance::new("hidden-fallback", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.extra_args = format!(
+            "--session-dir {}",
+            crate::session::environment::shell_escape(store.to_str().unwrap())
+        );
+
+        let binding = instance
+            .asserted_resume_binding(sid, Some(&transcript))
+            .expect("recovery still binds while the fallback is hidden");
+        assert_eq!(binding.session_id, sid);
+    }
+
     #[test]
     fn prime_native_options_preserve_managed_namespace_admission() {
         let temp = tempfile::tempdir().unwrap();
@@ -4881,6 +5059,7 @@ sandbox = "unsupported"
     }
 
     #[test]
+    #[serial_test::serial]
     fn managed_verbose_flag_is_allowed_without_namespace_effect() {
         for name in ["claude", "codex", "opencode", "omp", "prime-agent", "kimi"] {
             let agent = crate::agents::get_agent(name).unwrap();
