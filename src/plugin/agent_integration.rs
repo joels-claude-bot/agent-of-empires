@@ -531,24 +531,46 @@ fn custom_ownership(instance: &Instance, tool: &str) -> CustomOwnership {
 }
 
 /// Changes to these files invalidate the cached effective configuration.
-type ConfigStamp = Option<(u64, u64, i64, i64, i64, i64, u32)>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ConfigStamp {
+    /// No directory entry, which a reader resolves as no file at all.
+    Absent,
+    /// An entry whose target cannot be read: a dangling symlink or an
+    /// unreadable path. The reader attempts it and fails, so it must not share
+    /// `Absent`'s key with a deleted file.
+    Unreadable,
+    /// Target metadata of the file the reader opens.
+    Readable {
+        dev: u64,
+        ino: u64,
+        mtime: i64,
+        mtime_nsec: i64,
+        ctime: i64,
+        ctime_nsec: i64,
+        mode: u32,
+    },
+}
 
 fn stamp(path: &std::path::Path) -> ConfigStamp {
     use std::os::unix::fs::MetadataExt;
-    // Mode and ctime are part of the stamp: `chmod 000` makes a fresh read fail
-    // for a normal user while mtime can stay untouched, and a metadata-only
-    // change still moves ctime.
-    std::fs::metadata(path).ok().map(|meta| {
-        (
-            meta.dev(),
-            meta.ino(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ctime(),
-            meta.ctime_nsec(),
-            meta.mode(),
-        )
-    })
+    // Entry presence is stamped separately from target metadata: `chmod 000`
+    // makes a fresh read fail while mtime can stay untouched, so mode and ctime
+    // are part of it, and a dangling symlink has no target metadata to stamp.
+    if std::fs::symlink_metadata(path).is_err() {
+        return ConfigStamp::Absent;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => ConfigStamp::Readable {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mode: meta.mode(),
+        },
+        Err(_) => ConfigStamp::Unreadable,
+    }
 }
 
 /// Global, state, profile and repo config, resolved once per file-state change.
@@ -620,17 +642,19 @@ fn config_stamps(
     profile_dir: &std::path::Path,
     repo_dir: &std::path::Path,
 ) -> Vec<ConfigStamp> {
+    // Selected by directory entry, as the reader selects it: a dangling primary
+    // is attempted rather than skipped for the legacy path.
     let repo_config = [
         repo_dir.join(".agent-of-empires/config.toml"),
         repo_dir.join(".aoe/config.toml"),
     ]
     .into_iter()
-    .find(|path| path.exists());
+    .find(|path| std::fs::symlink_metadata(path).is_ok());
     vec![
         stamp(global_path),
         stamp(&crate::session::config::state_path().unwrap_or_default()),
         stamp(&profile_dir.join("config.toml")),
-        repo_config.as_deref().map(stamp).unwrap_or(None),
+        repo_config.as_deref().map_or(ConfigStamp::Absent, stamp),
     ]
 }
 
@@ -698,8 +722,11 @@ pub(crate) fn owned_status(
     }
     let registry = super::registry();
     let own = custom_ownership(instance, &instance.tool);
-    // A same-name custom wrapper is a different program from the declaration.
-    if own == CustomOwnership::Custom {
+    let own_claim = provider(&registry, &instance.tool);
+    // A same-name custom wrapper is a different program from the declaration,
+    // so a plugin claiming this session's own name has no report to give. A
+    // wrapper detected as another provider still answers through that alias.
+    if own == CustomOwnership::Custom && matches!(&own_claim, Ok(Some(_))) {
         return None;
     }
     let alias = crate::tmux::status_rules::detection_tool(
@@ -707,7 +734,7 @@ pub(crate) fn owned_status(
         &instance.tool,
         &instance.detect_as,
     );
-    let (tool, plugin) = match provider(&registry, &instance.tool) {
+    let (tool, plugin) = match own_claim {
         Ok(Some(plugin)) => (instance.tool.as_str(), Ok(Some(plugin))),
         Ok(None) => match provider(&registry, &alias) {
             // A `custom_agents` entry names the sessions it applies to, so one for
@@ -1845,6 +1872,57 @@ sandbox = "unsupported"
         assert!(declared_agent(registry, "shadow-agent", std::iter::empty()).is_none());
     }
 
+    /// A configured wrapper is its own program, but a session detected as
+    /// another provider still reads that provider's report. Only the own-name
+    /// declaration collision voids the claim.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn a_configured_wrapper_keeps_its_detected_provider_report() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-alias");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("my-acme".into(), "acme".into());
+        crate::tmux::status_rules::install_from_config("custom-alias", &config);
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("my-acme".into(), "/opt/wrappers/my-acme --serve".into());
+        })
+        .unwrap();
+        install_test_integration("acme.provider", "acme");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("custom-alias-report", "/tmp");
+        instance.tool = "my-acme".into();
+        instance.source_profile = "custom-alias".into();
+        instance.status = crate::session::Status::Running;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.provider.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true))
+        );
+    }
+
     #[test]
     #[serial_test::serial(hook_base)]
     fn unreadable_config_keeps_an_alias_claim_owned() {
@@ -1940,6 +2018,36 @@ sandbox = "unsupported"
     /// A linked worktree loads repo config from its main repository. The stamp
     /// must follow that same resolution, so editing the main repo's config
     /// invalidates a cache warm from the worktree.
+    /// A repo config that goes dangling must invalidate a warm entry. The reader
+    /// now fails, so the cached snapshot cannot keep granting it.
+    #[test]
+    #[serial_test::serial]
+    fn a_dangling_repo_config_invalidates_a_warm_entry() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let project = temp.path().join("project");
+        let repo_dir = project.join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let repo_config = repo_dir.join("config.toml");
+        std::fs::write(&repo_config, "[session]\n").unwrap();
+
+        let mut instance = Instance::new("dangling-repo-config", project.to_str().unwrap());
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+        effective_config(&instance).expect("a readable repo config resolves");
+
+        // The same path now names a missing target: no file content changes.
+        std::fs::remove_file(&repo_config).unwrap();
+        symlink(project.join("absent.toml"), &repo_config).unwrap();
+        assert!(
+            effective_config(&instance).is_err(),
+            "a dangling repo config must not reuse the warm grant"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_worktree_stamps_the_main_repo_config_it_loads() {
