@@ -1517,7 +1517,10 @@ const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {
-    AGENTS.iter().chain(crate::plugin::bundled_agents::available()).find(|a| a.name == name)
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+        .find(|a| a.name == name)
 }
 
 /// The native identity for `name`, whether or not a declaration supersedes it
@@ -1739,7 +1742,11 @@ pub fn ready_marker(tool: &str) -> Option<&'static str> {
 }
 
 pub fn agent_names() -> Vec<&'static str> {
-    AGENTS.iter().chain(crate::plugin::bundled_agents::available()).map(|a| a.name).collect()
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+        .map(|a| a.name)
+        .collect()
 }
 
 /// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
@@ -1765,7 +1772,10 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
         return Some("claude");
     }
     let mut best: Option<(usize, &'static str)> = None;
-    for agent in AGENTS.iter().chain(crate::plugin::bundled_agents::available()) {
+    for agent in AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+    {
         for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
             if lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
                 best = Some((token.len(), agent.name));
@@ -1795,7 +1805,11 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     if index == 0 {
         None
     } else {
-        AGENTS.iter().chain(crate::plugin::bundled_agents::available()).nth(index - 1).map(|a| a.name)
+        AGENTS
+            .iter()
+            .chain(crate::plugin::bundled_agents::available())
+            .nth(index - 1)
+            .map(|a| a.name)
     }
 }
 
@@ -1974,8 +1988,7 @@ mod tests {
             if agent.oneshot_flag_binds_prompt() {
                 assert!(agent.oneshot_extra_args().is_empty(), "{name}");
             }
-            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "prime-agent")
-            {
+            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "prime-agent") {
                 assert!(agent.oneshot_flag_binds_prompt(), "{name}");
             }
             assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");

@@ -1432,12 +1432,21 @@ mode = "native_only"
         let mut instance = Instance::new("omp-declaration", temp.path().to_str().unwrap());
         instance.tool = "omp".into();
         instance.status = crate::session::Status::Running;
-        assert!(instance.command.is_empty(), "legacy rows have no stored command");
+        assert!(
+            instance.command.is_empty(),
+            "legacy rows have no stored command"
+        );
         let fallback = || {
             let agent = crate::agents::get_agent("omp").expect("bundled fallback");
             assert_eq!(agent.oneshot_flag, Some("-p"));
-            assert_eq!(agent.container_env, &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]);
-            assert_eq!((agent.detect_status)("plain command output"), crate::session::Status::Idle);
+            assert_eq!(
+                agent.container_env,
+                &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]
+            );
+            assert_eq!(
+                (agent.detect_status)("plain command output"),
+                crate::session::Status::Idle
+            );
             assert!(agent.session_support.unwrap().capture.is_some());
             assert_eq!(instance.get_tool_command(), "omp");
             assert!(instance.declared_agent().is_none());
@@ -1445,19 +1454,31 @@ mode = "native_only"
         super::super::reload_registry();
         fallback(); // Present but not approved.
         crate::session::update_config(|config| {
-            config.plugins.insert("acme.omp-owner".into(), crate::session::PluginConfig {
-                grant: Some(crate::session::CapabilityGrant {
-                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
-                    capabilities: vec!["session.integration".into()],
-                    granted_at: chrono::Utc::now(),
-                }),
-                ..Default::default()
-            });
-        }).unwrap();
+            config.plugins.insert(
+                "acme.omp-owner".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
         super::super::reload_registry();
         assert!(crate::agents::get_agent("omp").is_none());
-        assert_eq!(instance.get_tool_command(), "OMP_MODE=plugin omp-next --verbose");
-        assert_eq!(instance.launch_executable_token().as_deref(), Some("omp-next"));
+        assert_eq!(
+            instance.get_tool_command(),
+            "OMP_MODE=plugin omp-next --verbose"
+        );
+        assert_eq!(
+            instance.launch_executable_token().as_deref(),
+            Some("omp-next")
+        );
         assert!(instance.supports_native_resume());
         let declared = instance.declared_agent().expect("approved declaration");
         declared.with_definition(|agent| {
@@ -1469,10 +1490,14 @@ mode = "native_only"
             assert_eq!(agent.session_support.unwrap().capture.unwrap().sandbox, crate::agents::SessionCaptureContext::Unsupported);
         }).unwrap();
         assert!(replies_configured(&instance));
-        assert_eq!(owned_status(&instance, false), Some((crate::session::Status::Unknown, false)));
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
         crate::session::update_config(|config| {
             config.plugins.get_mut("acme.omp-owner").unwrap().enabled = false;
-        }).unwrap();
+        })
+        .unwrap();
         super::super::reload_registry();
         assert!(declared.while_current(|| ()).is_none());
         fallback();
@@ -1480,7 +1505,8 @@ mode = "native_only"
             let plugin = config.plugins.get_mut("acme.omp-owner").unwrap();
             plugin.enabled = true;
             plugin.grant = None;
-        }).unwrap();
+        })
+        .unwrap();
         super::super::reload_registry();
         fallback(); // Revoked approval must not authorize the declaration.
     }

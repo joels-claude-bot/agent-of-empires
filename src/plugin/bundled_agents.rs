@@ -24,7 +24,10 @@ static DEFINITION: LazyLock<AgentDef<'static>> = LazyLock::new(|| {
 });
 
 pub(crate) fn contains(tool: &str) -> bool {
-    MANIFEST.agent_integrations.iter().any(|entry| entry.tool == tool)
+    MANIFEST
+        .agent_integrations
+        .iter()
+        .any(|entry| entry.tool == tool)
 }
 
 /// Static fallback metadata; callers decide whether an approved declaration takes over.
@@ -42,8 +45,7 @@ pub(crate) fn definition(tool: &str) -> Option<&'static AgentDef<'static>> {
 pub(crate) fn available() -> impl Iterator<Item = &'static AgentDef<'static>> {
     let registry = super::registry();
     definitions().filter(move |agent| {
-        super::agent_integration::declared_agent(
-            registry.clone(), agent.name, std::iter::empty(),
-        ).is_none()
+        super::agent_integration::declared_agent(registry.clone(), agent.name, std::iter::empty())
+            .is_none()
     })
 }

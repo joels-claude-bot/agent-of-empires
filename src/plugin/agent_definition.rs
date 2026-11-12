@@ -7,8 +7,8 @@ use aoe_plugin_api::agent_integration::{
 
 use crate::agents::{
     AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
-    ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec, SessionSupport,
-    YoloMode,
+    ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
+    SessionSupport, YoloMode,
 };
 
 /// Reference arrays owned separately from the declaration, without leaking a registry snapshot.
@@ -29,18 +29,34 @@ impl<'a> DefinitionData<'a> {
             }
         }
         Self {
-            aliases: entry.launch.iter().flat_map(|launch| {
-                launch.aliases.iter().map(String::as_str)
-            }).collect(),
-            environment: entry.launch.iter().flat_map(|launch| {
-                launch.container_env.iter().map(|(key, value)| (key.as_str(), value.as_str()))
-            }).collect(),
-            allow: entry.reply_fallback.as_ref()
+            aliases: entry
+                .launch
+                .iter()
+                .flat_map(|launch| launch.aliases.iter().map(String::as_str))
+                .collect(),
+            environment: entry
+                .launch
+                .iter()
+                .flat_map(|launch| {
+                    launch
+                        .container_env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                })
+                .collect(),
+            allow: entry
+                .reply_fallback
+                .as_ref()
                 .map_or_else(Vec::new, |reply| reply.allow.iter().map(key).collect()),
             always: entry.reply_fallback.as_ref().and_then(|reply| {
-                reply.allow_always.as_ref().map(|keys| keys.iter().map(key).collect())
+                reply
+                    .allow_always
+                    .as_ref()
+                    .map(|keys| keys.iter().map(key).collect())
             }),
-            deny: entry.reply_fallback.as_ref()
+            deny: entry
+                .reply_fallback
+                .as_ref()
                 .map_or_else(Vec::new, |reply| reply.deny.iter().map(key).collect()),
         }
     }
@@ -53,8 +69,9 @@ impl<'a> DefinitionData<'a> {
         let command = entry.command.as_deref()?;
         let (prefix, _) = aoe_plugin_api::agent_integration::launch_prefix(command)?;
         let binary = *prefix.last()?;
-        static DEFAULT_LAUNCH: std::sync::LazyLock<aoe_plugin_api::agent_integration::AgentLaunchDeclaration> =
-            std::sync::LazyLock::new(Default::default);
+        static DEFAULT_LAUNCH: std::sync::LazyLock<
+            aoe_plugin_api::agent_integration::AgentLaunchDeclaration,
+        > = std::sync::LazyLock::new(Default::default);
         let launch = entry.launch.as_ref().unwrap_or(&DEFAULT_LAUNCH);
         let yolo = launch.yolo.as_ref().map(|yolo| match yolo {
             AgentYoloDeclaration::Flag { flag } => YoloMode::CliFlag(flag),
@@ -64,10 +81,16 @@ impl<'a> DefinitionData<'a> {
         let support = launch.resume.as_ref().map(|resume| {
             let resume = match resume {
                 AgentResumeDeclaration::Flag { flag } => ResumeStrategy::Flag(flag),
-                AgentResumeDeclaration::FlagPair { existing, new_session } => {
-                    ResumeStrategy::FlagPair { existing, new_session }
+                AgentResumeDeclaration::FlagPair {
+                    existing,
+                    new_session,
+                } => ResumeStrategy::FlagPair {
+                    existing,
+                    new_session,
+                },
+                AgentResumeDeclaration::Subcommand { command } => {
+                    ResumeStrategy::Subcommand(command)
                 }
-                AgentResumeDeclaration::Subcommand { command } => ResumeStrategy::Subcommand(command),
             };
             let capture = launch.capture.as_ref().and_then(|capture| {
                 let context = |context| match context {

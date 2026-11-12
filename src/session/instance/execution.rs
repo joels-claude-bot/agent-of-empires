@@ -2003,7 +2003,8 @@ impl Instance {
                     .map(|(name, _)| name.as_str()),
             )
             .filter(|agent| {
-                self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str())
+                self.command.is_empty()
+                    || agent.contribution().command.as_deref() == Some(self.command.as_str())
             }) {
                 let identity = NativeAgent::Declared(declared.clone());
                 return declared

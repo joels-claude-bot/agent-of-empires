@@ -242,7 +242,10 @@ impl Instance {
                 .filter(|(_, command)| !command.trim().is_empty())
                 .map(|(name, _)| name.as_str()),
         )
-        .filter(|agent| self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str()))
+        .filter(|agent| {
+            self.command.is_empty()
+                || agent.contribution().command.as_deref() == Some(self.command.as_str())
+        })
     }
 
     fn declared_session_support(

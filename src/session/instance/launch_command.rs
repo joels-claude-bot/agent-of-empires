@@ -871,8 +871,10 @@ impl Instance {
         }
         std::borrow::Cow::Borrowed(
             crate::agents::get_agent(&self.tool)
-                .or_else(|| crate::plugin::bundled_agents::definitions()
-                    .find(|agent| agent.name == self.tool))
+                .or_else(|| {
+                    crate::plugin::bundled_agents::definitions()
+                        .find(|agent| agent.name == self.tool)
+                })
                 .map(|a| a.binary)
                 .unwrap_or("bash"),
         )
@@ -904,8 +906,10 @@ impl Instance {
                 }
             }
             crate::agents::get_agent(&self.tool)
-                .or_else(|| crate::plugin::bundled_agents::definitions()
-                    .find(|agent| agent.name == self.tool))
+                .or_else(|| {
+                    crate::plugin::bundled_agents::definitions()
+                        .find(|agent| agent.name == self.tool)
+                })
                 .map(|a| a.launch_base_command())
                 .unwrap_or_else(|| "bash".to_string())
         } else {
@@ -1265,7 +1269,8 @@ impl Instance {
                         .map(|(name, _)| name.as_str()),
                 );
                 if let Some(declared) = declared.filter(|agent| {
-                    self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str())
+                    self.command.is_empty()
+                        || agent.contribution().command.as_deref() == Some(self.command.as_str())
                 }) {
                     return declared
                         .with_definition(|agent| {
