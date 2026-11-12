@@ -579,14 +579,18 @@ fn stamp(path: &std::path::Path) -> ConfigStamp {
     }
 }
 
-/// Global, state, profile and repo config, resolved once per file-state change.
+/// Global, state and profile config, resolved once per file-state change.
 /// The status poll runs this per session per tick, so an uncached read would
 /// reparse every TOML file each time.
 ///
 /// One entry per configuration identity: a stamp change replaces the previous
 /// snapshot rather than accumulating one full `Config` per historical edit.
+///
+/// The repo layer is deliberately absent. Repo `custom_agents` merges to empty,
+/// so it cannot change ownership, while reading it opens a git repository per
+/// call and would let a malformed repo file fail a proven decision closed.
 fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session::Config>, ()> {
-    type Identity = (std::path::PathBuf, String, std::path::PathBuf);
+    type Identity = (std::path::PathBuf, String);
     type CacheKey = (Identity, Vec<ConfigStamp>);
     static CACHE: std::sync::LazyLock<
         std::sync::Mutex<
@@ -595,12 +599,10 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let profile = instance.effective_profile();
-    let project = std::path::PathBuf::from(&instance.project_path);
     let global_path = crate::session::config::config_path().map_err(|_| ())?;
     let profile_dir = crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
-    let repo_dir = crate::session::config::repo_config::repo_config_source_path(&project);
-    let identity = (global_path.clone(), profile.clone(), project);
-    let stamps = config_stamps(&global_path, &profile_dir, &repo_dir);
+    let identity = (global_path.clone(), profile.clone());
+    let stamps = config_stamps(&global_path, &profile_dir);
     let key = (identity.clone(), stamps.clone());
 
     {
@@ -614,13 +616,9 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
         let global = crate::session::Config::load().ok()?;
         let overrides =
             crate::session::config::profile_config::load_profile_config(&profile).ok()?;
-        let config = crate::session::config::profile_config::merge_configs(global, &overrides);
-        match crate::session::config::repo_config::load_repo_config(&repo_dir).ok()? {
-            Some(repo) => Some(crate::session::config::repo_config::merge_repo_config(
-                config, &repo,
-            )),
-            None => Some(config),
-        }
+        Some(crate::session::config::profile_config::merge_configs(
+            global, &overrides,
+        ))
     })()
     .ok_or(())?;
 
@@ -630,7 +628,7 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     // stamps while this call was loading. Compare the stamps again now that the
     // lock is held: if the files moved, this snapshot is stale, so serve it to
     // this caller without displacing the newer entry.
-    if config_stamps(&global_path, &profile_dir, &repo_dir) != stamps {
+    if config_stamps(&global_path, &profile_dir) != stamps {
         return Ok(resolved);
     }
     if let Some(existing) = cache.get(&key) {
@@ -641,36 +639,13 @@ fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session
     Ok(resolved)
 }
 
-/// The config files a session actually reads: the global config, the state file,
-/// the profile override, and the primary or legacy repo config under `repo_dir`.
-/// The repo config the reader selects, stamped by directory entry: an entry that
-/// cannot be inspected is unreadable, never absent.
-fn repo_config_stamp(repo_dir: &std::path::Path) -> ConfigStamp {
-    for path in [
-        repo_dir.join(".agent-of-empires/config.toml"),
-        repo_dir.join(".aoe/config.toml"),
-    ] {
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => return stamp(&path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return ConfigStamp::Unreadable,
-        }
-    }
-    ConfigStamp::Absent
-}
-
-fn config_stamps(
-    global_path: &std::path::Path,
-    profile_dir: &std::path::Path,
-    repo_dir: &std::path::Path,
-) -> Vec<ConfigStamp> {
-    // Selected by directory entry, as the reader selects it: a dangling primary
-    // is attempted rather than skipped for the legacy path.
+/// The config files ownership actually reads: the global config, the state file
+/// and the profile override.
+fn config_stamps(global_path: &std::path::Path, profile_dir: &std::path::Path) -> Vec<ConfigStamp> {
     vec![
         stamp(global_path),
         stamp(&crate::session::config::state_path().unwrap_or_default()),
         stamp(&profile_dir.join("config.toml")),
-        repo_config_stamp(repo_dir),
     ]
 }
 
@@ -679,7 +654,8 @@ fn config_stamps(
 /// same-name custom wrapper must keep its terminal approval keys.
 fn configured_for(instance: &Instance, replies: bool) -> bool {
     eligible(instance)
-        && custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin
+        // The registry decides whether any plugin can want this session, so the
+        // configuration is only read once one does.
         && super::registry().active().any(|plugin| {
             plugin
                 .manifest
@@ -692,6 +668,7 @@ fn configured_for(instance: &Instance, replies: bool) -> bool {
                     .iter()
                     .any(|entry| entry.tool == instance.tool && (!replies || entry.replies))
         })
+        && custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin
 }
 
 /// Return a fresh verified provider snapshot when available.
@@ -737,8 +714,23 @@ pub(crate) fn owned_status(
         return None;
     }
     let registry = super::registry();
-    let own = custom_ownership(instance, &instance.tool);
     let own_claim = provider(&registry, &instance.tool);
+    let alias = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let alias_claim = match own_claim {
+        Ok(None) => provider(&registry, &alias),
+        _ => Ok(None),
+    };
+    if matches!(&own_claim, Ok(None)) && matches!(&alias_claim, Ok(None)) {
+        // No plugin claims this session under either name, so nothing can grant
+        // it status: the per-tick path for an undeclared session reads no
+        // configuration at all.
+        return None;
+    }
+    let own = custom_ownership(instance, &instance.tool);
     // A same-name custom wrapper is a different program from the declaration,
     // so a plugin claiming this session's own name has no report to give. An
     // ambiguous claim is excluded too: the wrapper is readable and known, so it
@@ -747,14 +739,9 @@ pub(crate) fn owned_status(
     if own == CustomOwnership::Custom && !matches!(&own_claim, Ok(None)) {
         return None;
     }
-    let alias = crate::tmux::status_rules::detection_tool(
-        &instance.source_profile,
-        &instance.tool,
-        &instance.detect_as,
-    );
     let (tool, plugin) = match own_claim {
         Ok(Some(plugin)) => (instance.tool.as_str(), Ok(Some(plugin))),
-        Ok(None) => match provider(&registry, &alias) {
+        Ok(None) => match alias_claim {
             // A `custom_agents` entry names the sessions it applies to, so one for
             // the alias selects a command for sessions *named* that alias, not for
             // this differently named session. Alias authority is status-only, and
@@ -1009,6 +996,12 @@ pub fn respond(
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
+    // The dialog may have opened while the plugin still owned this name. Only a
+    // configuration that still leaves the name to the plugin may send keys.
+    ensure!(
+        custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin,
+        "a custom program now runs this agent, so the provider integration does not own its replies"
+    );
     let current = read_report(&instance.id, &instance.tool, plugin)?
         .context("provider integration report is unavailable")?;
     ensure!(
@@ -1934,6 +1927,92 @@ sandbox = "unsupported"
         assert!(!replies_configured(&instance));
     }
 
+    /// Repo config cannot select a custom command, so a malformed one must not
+    /// move a proven decision: the user's own configuration keeps deciding
+    /// whether the plugin or a custom program owns the name.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_repo_config_leaves_ownership_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        crate::plugin::reload_registry();
+        let project = temp.path().join("repo");
+        std::fs::create_dir_all(project.join(".agent-of-empires")).unwrap();
+        std::fs::write(project.join(".agent-of-empires/config.toml"), "[session\n").unwrap();
+
+        let mut instance = Instance::new("repo-config", project.to_str().unwrap());
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "repo-config".into();
+
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Plugin
+        );
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Custom
+        );
+    }
+
+    /// A reply dialog can open while the plugin owns the name. Adding a custom
+    /// command for that tool withdraws the authority the dialog was opened
+    /// under, so the sink must refuse instead of sending keys to the custom
+    /// program's pane.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn respond_refuses_after_a_custom_program_takes_the_name() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.stale-reply", "reply-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("stale-reply-test", "/tmp");
+        instance.tool = "reply-agent".into();
+        instance.status = crate::session::Status::Running;
+        assert_eq!(
+            custom_ownership(&instance, "reply-agent"),
+            CustomOwnership::Plugin
+        );
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("reply-agent".into(), "/opt/custom/reply --serve".into());
+        })
+        .unwrap();
+        let mut retained = snapshot();
+        retained.instance_id = instance.id.clone();
+        let error = respond(
+            &instance,
+            &retained,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not own its replies"),
+            "the reply must be refused on ownership, got {error}"
+        );
+    }
+
     /// A configured wrapper is its own program, but a session detected as
     /// another provider still reads that provider's report. Only the own-name
     /// declaration collision voids the claim.
@@ -2077,39 +2156,6 @@ sandbox = "unsupported"
         );
     }
 
-    /// A linked worktree loads repo config from its main repository. The stamp
-    /// must follow that same resolution, so editing the main repo's config
-    /// invalidates a cache warm from the worktree.
-    /// A repo config that goes dangling must invalidate a warm entry. The reader
-    /// now fails, so the cached snapshot cannot keep granting it.
-    #[test]
-    #[serial_test::serial]
-    fn a_dangling_repo_config_invalidates_a_warm_entry() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
-        let project = temp.path().join("project");
-        let repo_dir = project.join(".agent-of-empires");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        let repo_config = repo_dir.join("config.toml");
-        std::fs::write(&repo_config, "[session]\n").unwrap();
-
-        let mut instance = Instance::new("dangling-repo-config", project.to_str().unwrap());
-        instance.tool = "wrapped".into();
-        instance.status = crate::session::Status::Running;
-        effective_config(&instance).expect("a readable repo config resolves");
-
-        // The same path now names a missing target: no file content changes.
-        std::fs::remove_file(&repo_config).unwrap();
-        symlink(project.join("absent.toml"), &repo_config).unwrap();
-        assert!(
-            effective_config(&instance).is_err(),
-            "a dangling repo config must not reuse the warm grant"
-        );
-    }
-
     /// A warm `Absent` profile override must not survive its directory becoming
     /// unsearchable: the reader then rejects the path, so absence cannot share
     /// the key that keeps the cached grant.
@@ -2170,71 +2216,6 @@ sandbox = "unsupported"
             custom_ownership(&instance, "wrapped"),
             CustomOwnership::Unavailable,
             "the cached grant must not outlive an unreadable configuration"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_worktree_stamps_the_main_repo_config_it_loads() {
-        let temp = tempfile::tempdir().unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("HOME", temp.path()),
-            ("XDG_CONFIG_HOME", temp.path()),
-            ("USERPROFILE", temp.path()),
-        ]);
-        // A main repo whose `.git` is a directory, per `find_main_repo`.
-        let main = temp.path().join("main-repo");
-        std::fs::create_dir_all(main.join(".git/worktrees/linked")).unwrap();
-        let repo_config_dir = main.join(".agent-of-empires");
-        std::fs::create_dir_all(&repo_config_dir).unwrap();
-        let repo_config = repo_config_dir.join("config.toml");
-        std::fs::write(&repo_config, "[session]\n").unwrap();
-
-        // A linked worktree points at `<main>/.git/worktrees/linked`.
-        let worktree = temp.path().join("linked-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", main.join(".git/worktrees/linked").display()),
-        )
-        .unwrap();
-
-        let mut instance = Instance::new("worktree-cache", worktree.to_str().unwrap());
-        instance.tool = "wrapped".into();
-        instance.status = crate::session::Status::Running;
-
-        // The loader resolves the worktree to the main repo, so must the stamp.
-        let resolved = crate::session::config::repo_config::repo_config_source_path(&worktree);
-        assert_eq!(
-            resolved,
-            main.canonicalize().unwrap_or_else(|_| main.clone()),
-            "a linked worktree must resolve repo config to its main repo"
-        );
-        let global = crate::session::config::config_path().unwrap();
-        let profile_dir = temp.path().join("profile");
-        let repo_stamp = *config_stamps(&global, &profile_dir, &resolved)
-            .last()
-            .unwrap();
-        assert_eq!(
-            repo_stamp,
-            stamp(&repo_config),
-            "the stamp must watch the file the loader resolves"
-        );
-
-        // Warm the cache through the real loader.
-        let warm = effective_config(&instance).unwrap();
-        // An unchanged configuration must reuse the cached snapshot.
-        let again = effective_config(&instance).unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(&warm, &again),
-            "an unchanged configuration must hit the cache"
-        );
-        // Editing the main repo config the worktree loads must reload it.
-        std::fs::write(&repo_config, "# changed\n[session]\n").unwrap();
-        let after = effective_config(&instance).unwrap();
-        assert!(
-            !std::sync::Arc::ptr_eq(&warm, &after),
-            "editing the worktree's main repo config must invalidate the cache"
         );
     }
 
