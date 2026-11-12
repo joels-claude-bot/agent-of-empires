@@ -1520,6 +1520,16 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {
     AGENTS.iter().chain(crate::plugin::bundled_agents::available()).find(|a| a.name == name)
 }
 
+/// The native identity for `name`, whether or not a declaration supersedes it
+/// in listings. A tool keeps the identity its own contract names, so mounts,
+/// stores and recovery do not depend on which plugin currently provides it.
+pub(crate) fn native_definition(name: &str) -> Option<&'static AgentDef<'static>> {
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::definitions())
+        .find(|agent| agent.name == name)
+}
+
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)
