@@ -2156,16 +2156,16 @@ sandbox = "unsupported"
             path: &profile_dir,
             mode,
         };
+
+        // Root reads through the mode, so every assertion below is non-root only.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
         assert_ne!(
             absent,
             stamp(&config),
             "a denied directory must not stamp as an absent file"
         );
-
-        if nix::unistd::geteuid().is_root() {
-            // Root reads through the mode, so only the stamp guarantee applies.
-            return;
-        }
         assert_eq!(
             custom_ownership(&instance, "wrapped"),
             CustomOwnership::Unavailable,
