@@ -311,16 +311,8 @@ fn resolve_host_creation(
             }
             body.tool = name.to_owned();
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
-            anyhow::ensure!(
-                !plugin_owned(tool) || body.command_override.is_empty(),
-                "--cmd-override cannot be used with plugin-provided agent --tool selections"
-            );
             body.tool = tool.to_owned();
         } else if let Some(tool) = plugin_tool(name) {
-            anyhow::ensure!(
-                !plugin_owned(&tool) || body.command_override.is_empty(),
-                "--cmd-override cannot be used with configured plugin agent --tool selections"
-            );
             body.tool = tool;
         } else {
             anyhow::ensure!(
@@ -357,8 +349,8 @@ fn resolve_host_creation(
             }
         }
     }
-    // Implicit selection (default_tool) is a --tool choice too, so it owns the
-    // same rejection as the explicit paths above.
+    // Every selection path lands here with its canonical tool, so this one check
+    // rejects the override for explicit and implicit plugin selections alike.
     if !body.command_override.is_empty() && plugin_owned(&body.tool) {
         anyhow::bail!("--cmd-override cannot be used with plugin-provided agent --tool selections");
     }
