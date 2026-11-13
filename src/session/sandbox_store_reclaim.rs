@@ -1196,55 +1196,6 @@ mod tests {
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
     }
 
-    /// Install an approved declaration that provides `omp` through `command`,
-    /// the way the plugin release supersedes the bundled fallback.
-    fn install_omp_declaration(command: &str) {
-        let manifest = format!(
-            r#"
-id = "acme.omp-cutover"
-name = "OMP cutover"
-version = "1.0.0"
-api_version = 21
-capabilities = ["session.integration"]
-
-[[agent_integrations]]
-tool = "omp"
-command = "{command}"
-
-[agent_integrations.launch.resume]
-kind = "flag"
-flag = "--resume"
-
-[agent_integrations.launch.capture]
-backend = "omp"
-host = "pane_scoped"
-sandbox = "pane_scoped"
-"#
-        );
-        let dir = crate::plugin::plugins_dir()
-            .unwrap()
-            .join("acme.omp-cutover");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
-        crate::session::update_config(|config| {
-            config.plugins.insert(
-                "acme.omp-cutover".into(),
-                crate::session::PluginConfig {
-                    grant: Some(crate::session::CapabilityGrant {
-                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
-                            manifest.as_bytes(),
-                        ),
-                        capabilities: vec!["session.integration".into()],
-                        granted_at: chrono::Utc::now(),
-                    }),
-                    ..crate::session::PluginConfig::default()
-                },
-            );
-        })
-        .unwrap();
-        crate::plugin::reload_registry();
-    }
-
     /// A declaration supersedes the bundled OMP listing, but the tool keeps the
     /// identity its own contract names: the declaration's command still owns
     /// OMP's store, `agent_execution_as` still names it, and purge still
@@ -1256,7 +1207,7 @@ sandbox = "pane_scoped"
         // Declared first so it reloads after the app directory is restored.
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
-        install_omp_declaration("omp-next");
+        crate::session::test_support::install_omp_takeover("omp-next");
         let resolve =
             |tool: &str, command: &str, session: &crate::session::config::SessionConfig| {
                 crate::session::config::container_config::resolve_active_agent(
