@@ -571,6 +571,7 @@ impl Instance {
         }
         if crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::definitions())
             .any(|other| other.binary == program && other.name != agent.name)
         {
             return None;
@@ -1041,6 +1042,23 @@ mod tests {
             .expect("a recorded native omp execution keeps its capture");
         assert_eq!(capture.backend, crate::agents::SessionCaptureBackend::Omp);
         assert_eq!(context, crate::agents::SessionCaptureContext::PaneScoped);
+    }
+
+    /// A wrapper whose bare command is another native agent's binary is not a
+    /// bare wrapper of its own tool. The bundled definitions count: `omp` left
+    /// the native table, and a wrapper naming it must not become a `claude`
+    /// selector just because only `AGENTS` was searched.
+    #[test]
+    fn a_bare_command_naming_the_bundled_omp_binary_is_not_this_tool() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.command = "omp".into();
+        assert!(inst.legacy_default_selector_agent().is_none());
+
+        inst.command = "claude".into();
+        assert!(
+            inst.legacy_default_selector_agent().is_some(),
+            "a bare native wrapper keeps its selector"
+        );
     }
 
     fn worktree(main_repo_path: &str) -> WorktreeInfo {
