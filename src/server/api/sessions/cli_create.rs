@@ -240,17 +240,19 @@ fn resolve_host_creation(
             names.join(", ")
         )
     };
+    let configured_custom_agents: Vec<&str> = config
+        .session
+        .custom_agents
+        .iter()
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
     let plugin_registry = crate::plugin::registry();
     let plugin_tool = |command: &str| {
         crate::plugin::agent_integration::resolve_declared_tool(
             &plugin_registry,
             command,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
+            configured_custom_agents.iter().copied(),
         )
     };
     let plugin_owned = |name: &str| {
@@ -265,12 +267,7 @@ fn resolve_host_creation(
         crate::plugin::agent_integration::declared_agent(
             plugin_registry.clone(),
             name,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
+            configured_custom_agents.iter().copied(),
         )
         .is_some()
     };
@@ -352,7 +349,7 @@ fn resolve_host_creation(
     // Every selection path lands here with its canonical tool, so this one check
     // rejects the override for explicit and implicit plugin selections alike.
     if !body.command_override.is_empty() && plugin_owned(&body.tool) {
-        anyhow::bail!("--cmd-override cannot be used with plugin-provided agent --tool selections");
+        anyhow::bail!("--cmd-override cannot be used with a plugin-provided agent");
     }
     if explicit_tool {
         let configured = config.session.resolve_tool_command(&body.tool);
@@ -430,6 +427,7 @@ fn resolve_host_creation(
                     std::path::Path::new(&body.path),
                     body.scratch,
                     body.trust_hooks,
+                    body.skip_on_create,
                 )
             },
         };

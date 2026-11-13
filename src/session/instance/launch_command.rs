@@ -39,7 +39,7 @@ type LaunchRouting = (
 );
 
 fn prepared_fork_mints_child(
-    agent: Option<&crate::agents::AgentDef<'_>>,
+    agent: Option<&crate::agents::AgentDef>,
     intent: &ResumeIntent,
     context: &super::execution::AgentLaunchContext<'_>,
 ) -> bool {
@@ -329,7 +329,7 @@ pub(super) fn environment_defines_path(environment: &[String]) -> bool {
 }
 
 pub(super) fn build_resume_flags(
-    agent: Option<&crate::agents::AgentDef<'_>>,
+    agent: Option<&crate::agents::AgentDef>,
     session_id: &str,
     is_existing_session: bool,
 ) -> String {
@@ -520,7 +520,7 @@ pub(super) fn splice_subcommand_or_append(
 }
 
 pub(super) fn append_resume_flags(
-    agent: Option<&crate::agents::AgentDef<'_>>,
+    agent: Option<&crate::agents::AgentDef>,
     session_id: Option<&str>,
     is_existing_session: bool,
     cmd: &mut String,
@@ -556,7 +556,7 @@ pub(super) fn append_resume_flags(
 /// web renderer handles ANSI fine. Unsetting `NO_COLOR` and advertising
 /// `TERM=xterm-256color` plus `COLORTERM=truecolor` at launch keeps color on
 /// without pinning tools to a specific `FORCE_COLOR` depth.
-fn apply_agent_launch_env(cmd: &mut String, agent: Option<&crate::agents::AgentDef<'_>>) {
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&crate::agents::AgentDef>) {
     if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
         return;
     }
@@ -1340,7 +1340,7 @@ impl Instance {
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
-        agent: Option<&crate::agents::AgentDef<'_>>,
+        agent: Option<&crate::agents::AgentDef>,
     ) -> Result<LaunchCommandParts> {
         let parts = if self.is_sandboxed() {
             let fallback_container_name = execution
@@ -1583,7 +1583,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command(
         &mut self,
-        agent: Option<&crate::agents::AgentDef<'_>>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
@@ -1600,7 +1600,7 @@ impl Instance {
     fn build_host_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&crate::agents::AgentDef<'_>>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
@@ -1625,7 +1625,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command_with_identity_extension(
         &mut self,
-        agent: Option<&crate::agents::AgentDef<'_>>,
+        agent: Option<&crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
@@ -1644,7 +1644,7 @@ impl Instance {
     fn build_host_command_with_identity_extension_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&crate::agents::AgentDef<'_>>,
+        agent: Option<&crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
