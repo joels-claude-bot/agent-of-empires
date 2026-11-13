@@ -979,8 +979,12 @@ fn run_pass(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
+            // A declaration can hold the listing; the store still belongs to
+            // the identity the tool's own contract names.
             let Some(agent) = crate::agents::get_agent(tool)
+                .or_else(|| crate::agents::native_definition(tool))
                 .or_else(|| detect_as.and_then(crate::agents::get_agent))
+                .or_else(|| detect_as.and_then(crate::agents::native_definition))
             else {
                 defer_source_retirement = true;
                 continue;
@@ -1781,7 +1785,9 @@ fn collect_row_ids_by_root(
                 .filter(|value| !value.is_empty())
                 .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
             let Some(agent) = crate::agents::get_agent(tool)
+                .or_else(|| crate::agents::native_definition(tool))
                 .or_else(|| detect_as.and_then(crate::agents::get_agent))
+                .or_else(|| detect_as.and_then(crate::agents::native_definition))
             else {
                 continue;
             };
@@ -2734,6 +2740,49 @@ mod tests {
 
     fn row(id: &str) -> String {
         format!(r#"{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":true}}}}"#)
+    }
+
+    /// An approved OMP takeover removes `omp` from the agent listing, but a
+    /// legacy store still belongs to the identity its own contract names. The
+    /// cohort has to migrate on every pass, not only while no plugin provides
+    /// the tool: a skipped row never reaches the current generation, so content
+    /// admission refuses it for as long as the takeover is enabled.
+    #[test]
+    #[serial_test::serial]
+    fn an_omp_takeover_still_migrates_a_legacy_cohort() {
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let (_temp, _app_guard, app, home) = isolated();
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(
+            crate::agents::get_agent("omp").is_none(),
+            "an approved takeover supersedes the bundled listing"
+        );
+
+        let legacy = home.join(".omp/sandbox");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("data"), b"data").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"omp","sandbox_info":{"enabled":true}}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(
+            fs::read(home.join(".omp/sandbox-v2/1111111111111111/data")).unwrap(),
+            b"data",
+            "a takeover must not strand the legacy cohort"
+        );
+        let rows: Value = read_rows(&app);
+        assert_eq!(
+            rows[0]["sandbox_store_generation"],
+            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        );
     }
 
     /// An isolated app dir and `HOME` for one pass. Bind the tempdir before

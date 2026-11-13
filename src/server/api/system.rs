@@ -3906,8 +3906,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_plugin_row_reports_only_the_adapter_the_host_registered() {
-        let _home = crate::session::test_support::isolate_app_dir();
+        // Declared first so it reloads after the app directory is restored.
         let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
         let manifest = r#"
 id = "acme.takeover"
 name = "Takeover"

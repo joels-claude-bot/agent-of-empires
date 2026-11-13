@@ -1725,8 +1725,11 @@ impl Instance {
 
         if self.command.is_empty() {
             match agent {
-                Some(a) => {
-                    let supplied = a.launch_base_command();
+                Some(_) => {
+                    // A blank stored command can still select an approved
+                    // declaration whose command carries an assignment and fixed
+                    // arguments; the binary alone would drop them.
+                    let supplied = self.get_launch_command();
                     let guarded = appended_flag_invocation(&supplied, &self.extra_args);
                     let mut cmd = self.freeze_native_invocation(
                         supplied.clone(),
@@ -2271,6 +2274,36 @@ sandbox = "unsupported"
             prepared.command.unwrap().contains("--yolo"),
             "the direct command must receive the mode flag"
         );
+    }
+
+    /// A legacy row with a blank stored command launches the declaration's
+    /// complete command: its assignment and fixed argument are part of the
+    /// invocation, not just its binary. A stored command is rendered as written.
+    #[test]
+    #[serial_test::serial]
+    fn a_blank_stored_command_renders_the_declared_command_in_full() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::test_support::install_omp_takeover("OMP_MODE=plugin omp-next --verbose");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        for stored in ["", "OMP_MODE=plugin omp-next --verbose"] {
+            let mut inst = Instance::new("omp", project.to_str().unwrap());
+            inst.tool = "omp".into();
+            inst.command = stored.into();
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap_or_else(|error| panic!("stored `{stored}`: {error}"));
+            let command = prepared.command.expect("a declaration launches");
+            assert!(
+                command.contains("OMP_MODE=plugin omp-next --verbose"),
+                "stored `{stored}`: {command}"
+            );
+        }
     }
 
     /// An appended argument is argv for the agent unless the shell would route it

@@ -1253,8 +1253,9 @@ sandbox = "pane_scoped"
     #[serial_test::serial]
     fn declared_omp_keeps_the_identity_its_stores_and_wrappers_resolve() {
         let dir = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        // Declared first so it reloads after the app directory is restored.
         let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
         install_omp_declaration("omp-next");
         let resolve =
             |tool: &str, command: &str, session: &crate::session::config::SessionConfig| {
@@ -1279,21 +1280,32 @@ sandbox = "pane_scoped"
         let mut instance = crate::session::Instance::new("t", "/tmp/p");
         instance.tool = "omp".into();
         instance.command = "omp-next".into();
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "aoe-sandbox-omp-takeover".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
         instance.sandbox_store_generation =
             crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+        // Real admission, not a hand-made certificate: the takeover must not
+        // block the store the tool's own identity owns.
+        drop(
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(&instance)
+                .expect("an approved takeover must still admit omp's own store"),
+        );
         let store = dir
             .path()
             .join(".omp")
             .join("sandbox-v2")
             .join(&instance.id);
-        fs::create_dir_all(&store).unwrap();
-        fs::write(store.join("owned"), b"owned").unwrap();
-        content::certify_owned_test_root(
-            &crate::session::get_app_dir().unwrap(),
-            &instance.id,
-            &store,
-        )
-        .unwrap();
+        assert!(store.exists(), "admission must create the isolated store");
         let (removed, _) =
             remove_stores_for(&instance, &crate::session::config::Config::default()).unwrap();
         assert_eq!(removed, vec![store.clone()]);
