@@ -15,6 +15,10 @@ macro_rules! aoe_hook_marker {
 /// canonical `dir_guard::hook_base_path()/<id>` onto `<this>/<id>`.
 pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = concat!("/tmp/", aoe_hook_marker!());
 
+/// The default host base as a shell word. `$ME` is the `id -u` result, so the
+/// installed text carries no uid and is identical across machines.
+const HOOK_STATUS_BASE_ON_HOST: &str = concat!("/tmp/", aoe_hook_marker!(), "-$ME");
+
 const AOE_HOOK_MARKER: &str = aoe_hook_marker!();
 
 /// Every emitter ends with `exit 0 # aoe-hooks`; the `0 ` binds the match to
@@ -41,7 +45,15 @@ pub(super) fn json_command_is_aoe(entry: &serde_json::Value) -> bool {
 
 fn hook_base_for_target(target: HookInstallTarget) -> String {
     match target {
-        HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
+        HookInstallTarget::Host => {
+            let base = dir_guard::hook_base_path();
+            // Only tests point the base elsewhere; that path is baked literally.
+            if base == dir_guard::default_hook_base_path() {
+                HOOK_STATUS_BASE_ON_HOST.to_string()
+            } else {
+                base.display().to_string()
+            }
+        }
         HookInstallTarget::Sandbox => HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
     }
 }
@@ -141,26 +153,27 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
 /// authoritative gate); sandbox commands skip the uid check because the
 /// container uid is unpredictable and the bind source was validated host-side.
 fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -> String {
-    let (parent_check, owner_recheck) = match target {
+    let (uid, parent_check, owner_recheck) = match target {
+        // `id -u` prints the effective uid, matching `dir_guard`'s `geteuid()`.
         // `mkdir -p $B` recovers from a /tmp reaper. It relies on /tmp's sticky
         // bit; re-audit if the base ever moves out of /tmp.
         HookInstallTarget::Host => (
+            "ME=$(id -u 2>/dev/null) || exit 0; ",
             "\
              mkdir -p \"$B\" 2>/dev/null || exit 0; \
              LS=$(LC_ALL=C ls -ldn \"$B\" 2>/dev/null) || exit 0; \
              set -- $LS; M=\"$1\"; \
              case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
-             ME=$(id -u 2>/dev/null) || exit 0; \
              [ \"$3\" = \"$ME\" ] || exit 0; ",
             "[ \"$3\" = \"$ME\" ] || exit 0; ",
         ),
-        HookInstallTarget::Sandbox => ("", ""),
+        HookInstallTarget::Sandbox => ("", "", ""),
     };
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
-         B={base}; {parent_check}\
+         {uid}B={base}; {parent_check}\
          D=\"$B/$AOE_INSTANCE_ID\"; \
          mkdir -p \"$D\" 2>/dev/null; \
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
@@ -448,14 +461,26 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn host_status_command_bakes_per_user_base() {
-        for euid in [1000u32, 65534, 0] {
-            let _g = crate::hooks::test_support::BaseGuard::with_base(PathBuf::from(format!(
-                "/tmp/aoe-hooks-{euid}"
-            )));
+    fn host_status_command_resolves_default_base_uid_at_run_time() {
+        let euid = nix::unistd::geteuid().as_raw();
+        // (base override, expected `B=` assignment)
+        let cases = [
+            (None, "B=/tmp/aoe-hooks-$ME;".to_string()),
+            (
+                Some(PathBuf::from("/tmp/aoe-test-base")),
+                "B=/tmp/aoe-test-base;".to_string(),
+            ),
+        ];
+        for (base, want) in cases {
+            let _g = base.map(crate::hooks::test_support::BaseGuard::with_base);
             let cmd = hook_command("running", HookInstallTarget::Host);
-            assert!(cmd.contains(&format!("B=/tmp/aoe-hooks-{euid};")), "{cmd}");
-            assert!(cmd.contains("ME=$(id -u 2>/dev/null)"), "{cmd}");
+            let uid_at = cmd.find("ME=$(id -u 2>/dev/null) || exit 0;");
+            let base_at = cmd.find(&want);
+            assert!(
+                uid_at.is_some() && base_at.is_some() && uid_at < base_at,
+                "{cmd}"
+            );
+            assert!(!cmd.contains(&format!("aoe-hooks-{euid}")), "{cmd}");
         }
     }
 

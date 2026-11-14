@@ -45,6 +45,10 @@ thread_local! {
 
 /// Per-user host base path. The suffix is `geteuid()`, not `getuid()`: the
 /// agent writes through `id -u`, so both ends agree.
+pub(crate) fn default_hook_base_path() -> PathBuf {
+    PathBuf::from(format!("/tmp/aoe-hooks-{}", geteuid().as_raw()))
+}
+
 pub(crate) fn hook_base_path() -> PathBuf {
     #[cfg(test)]
     {
@@ -52,7 +56,7 @@ pub(crate) fn hook_base_path() -> PathBuf {
             return p;
         }
     }
-    PathBuf::from(format!("/tmp/aoe-hooks-{}", geteuid().as_raw()))
+    default_hook_base_path()
 }
 
 #[cfg(test)]
