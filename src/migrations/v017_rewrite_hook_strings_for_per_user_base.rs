@@ -516,10 +516,8 @@ mod tests {
                             && cmd.contains("LC_ALL=C ls -ldn"),
                         "v017 must bake the env preamble: {cmd}"
                     );
-                    let euid = nix::unistd::geteuid().as_raw();
-                    let suffix = format!("/tmp/aoe-hooks-{euid}");
                     assert!(
-                        cmd.contains(&format!("B={suffix}")),
+                        cmd.contains("B=/tmp/aoe-hooks-$(id -u);"),
                         "v017 must bake the per-user base: {cmd}"
                     );
                 }

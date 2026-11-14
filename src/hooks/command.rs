@@ -2,7 +2,7 @@
 
 use crate::agents::{HookIdentityField, HookStatus};
 
-use super::{dir_guard, HookInstallTarget};
+use super::HookInstallTarget;
 
 /// `concat!` only accepts literals, so the marker is a macro shared by the constants below.
 macro_rules! aoe_hook_marker {
@@ -41,7 +41,7 @@ pub(super) fn json_command_is_aoe(entry: &serde_json::Value) -> bool {
 
 fn hook_base_for_target(target: HookInstallTarget) -> String {
     match target {
-        HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
+        HookInstallTarget::Host => "/tmp/aoe-hooks-$(id -u)".to_string(),
         HookInstallTarget::Sandbox => HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
     }
 }
@@ -447,16 +447,10 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(hook_base)]
-    fn host_status_command_bakes_per_user_base() {
-        for euid in [1000u32, 65534, 0] {
-            let _g = crate::hooks::test_support::BaseGuard::with_base(PathBuf::from(format!(
-                "/tmp/aoe-hooks-{euid}"
-            )));
-            let cmd = hook_command("running", HookInstallTarget::Host);
-            assert!(cmd.contains(&format!("B=/tmp/aoe-hooks-{euid};")), "{cmd}");
-            assert!(cmd.contains("ME=$(id -u 2>/dev/null)"), "{cmd}");
-        }
+    fn host_status_command_resolves_per_user_base_at_run_time() {
+        let cmd = hook_command("running", HookInstallTarget::Host);
+        assert!(cmd.contains("B=/tmp/aoe-hooks-$(id -u);"), "{cmd}");
+        assert!(cmd.contains("ME=$(id -u 2>/dev/null)"), "{cmd}");
     }
 
     #[test]
