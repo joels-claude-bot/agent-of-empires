@@ -2762,12 +2762,28 @@ mod tests {
         let legacy = home.join(".omp/sandbox");
         fs::create_dir_all(&legacy).unwrap();
         fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"omp","sandbox_info":{"enabled":true}}
-        ]);
+        let project = home.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut legacy_row = crate::session::Instance::new("t", project.to_str().unwrap());
+        legacy_row.id = "1111111111111111".into();
+        legacy_row.tool = "omp".into();
+        legacy_row.command = String::new();
+        legacy_row.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "aoe-sandbox-takeover".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        legacy_row.sandbox_store_generation = 0;
         fs::write(
             app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
+            serde_json::to_vec(&vec![legacy_row]).unwrap(),
         )
         .unwrap();
 
@@ -2782,6 +2798,27 @@ mod tests {
         assert_eq!(
             rows[0]["sandbox_store_generation"],
             crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        );
+
+        // The migrated row is populated, so admission needs v033 to reconcile
+        // and certify the store v027 published, with the takeover still
+        // approved, before the row can launch.
+        let _probes =
+            crate::migrations::v033_isolate_sandbox_content::install_test_reconcile_probes(
+                |_| Ok(false),
+                |_| Ok(true),
+                |_| Ok(Vec::new()),
+            );
+        crate::migrations::v033_isolate_sandbox_content::reconcile_pending(true).unwrap();
+        let admitted: crate::session::Instance =
+            serde_json::from_value(rows[0].clone()).expect("the migrated row is a session");
+        drop(
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(&admitted)
+                .expect("an admitted legacy cohort stays admissible under the takeover"),
+        );
+        assert!(
+            crate::migrations::v033_isolate_sandbox_content::instance_ready(&admitted).unwrap(),
+            "admission certifies the migrated store"
         );
     }
 
